@@ -61,13 +61,42 @@ TRACK_COLOR = QColor(60, 65, 75, 180)
 TEXT_COLOR = QColor(235, 235, 240)
 SUB_COLOR = QColor(160, 165, 175)
 
-# Ring colors keyed by utilization band
-def ring_color(pct: float) -> QColor:
-    if pct >= 90:
-        return QColor(235, 80, 80)      # red
-    if pct >= 70:
-        return QColor(235, 175, 60)     # amber
-    return QColor(110, 200, 140)        # green
+# Severity colors keyed by an urgency band.
+RED   = QColor(235,  80,  80)
+AMBER = QColor(235, 175,  60)
+GREEN = QColor(110, 200, 140)
+
+
+def ring_color(score: float) -> QColor:
+    """Bucket a 0-100 score into the three severity colors."""
+    if score >= 90: return RED
+    if score >= 70: return AMBER
+    return GREEN
+
+
+def urgency_score(pct: float | None, time_rem_pct: float | None) -> float:
+    """Time-normalized urgency: how much MORE of the quota you've used than
+    the fraction of the reset window that has elapsed.
+
+      urgency = pct − (100 − time_rem_pct) = pct + time_rem_pct − 100
+
+    < 0: ahead of schedule (you'll finish under quota)
+      0: exactly on pace
+    > 0: burning faster than the reset can save you
+
+    Mapped to a 0-100 colour scale: 0 → green, 30 → amber, 60 → red.
+    """
+    if pct is None:
+        return 0.0
+    if time_rem_pct is None:
+        return pct  # No time info — fall back to raw severity
+    excess = pct + time_rem_pct - 100.0     # can be negative
+    # Scale so excess=60 hits 100 (red threshold), excess=42 hits 70 (amber)
+    return max(0.0, min(100.0, excess * (100.0 / 60.0)))
+
+
+def urgency_color(pct: float | None, time_rem_pct: float | None) -> QColor:
+    return ring_color(urgency_score(pct, time_rem_pct))
 
 
 def load_state() -> dict:
@@ -193,10 +222,13 @@ class RingGauge:
     def __init__(self, label: str) -> None:
         self.label = label
         self.pct: float | None = None
+        self.time_rem_pct: float | None = None
         self.reset_label = "—"
 
-    def update(self, pct: float | None, reset_iso: str | None) -> None:
+    def update(self, pct: float | None, reset_iso: str | None,
+               time_rem_pct: float | None) -> None:
         self.pct = pct
+        self.time_rem_pct = time_rem_pct
         self.reset_label = fmt_reset(reset_iso)
 
     def paint(self, p: QPainter, rect: QRectF) -> None:
@@ -216,7 +248,8 @@ class RingGauge:
                   0, 360 * 16)
 
         pct = 0.0 if self.pct is None else max(0.0, min(100.0, self.pct))
-        pen_val = QPen(ring_color(pct), thickness, Qt.SolidLine, Qt.RoundCap)
+        pen_val = QPen(urgency_color(pct, self.time_rem_pct),
+                       thickness, Qt.SolidLine, Qt.RoundCap)
         p.setPen(pen_val)
         # Qt arcs: start at 3 o'clock (0°), positive = counter-clockwise.
         # Start at 12 (90°), sweep clockwise (negative angle).
@@ -390,22 +423,24 @@ class Widget(QWidget):
 
         five = data.get("five_hour") or {}
         seven = data.get("seven_day") or {}
-        self.gauge_5h.update(five.get("utilization"), five.get("resets_at"))
-        self.gauge_7d.update(seven.get("utilization"), seven.get("resets_at"))
+        pct5 = five.get("utilization")
+        pct7 = seven.get("utilization")
+        tr5 = time_remaining_pct(five.get("resets_at"), 5 * 3600)
+        tr7 = time_remaining_pct(seven.get("resets_at"), 7 * 86400)
+        self.gauge_5h.update(pct5, five.get("resets_at"), tr5)
+        self.gauge_7d.update(pct7, seven.get("resets_at"), tr7)
 
         tooltip = self._tooltip(data)
         self.setToolTip(tooltip)
-        pct5 = five.get("utilization")
-        pct7 = seven.get("utilization")
         if self.tray_5h is not None:
-            self.tray_5h.setIcon(make_tray_icon("5H", pct5))
+            self.tray_5h.setIcon(make_tray_icon(pct5, tr5))
             reset5 = fmt_reset(five.get("resets_at"))
             self.tray_5h.setToolTip(
                 f"5-hour session: {pct5:.0f}% — resets in {reset5}"
                 if pct5 is not None else "5-hour session: —"
             )
         if self.tray_7d is not None:
-            self.tray_7d.setIcon(make_tray_icon("7D", pct7))
+            self.tray_7d.setIcon(make_tray_icon(pct7, tr7))
             reset7 = fmt_reset(seven.get("resets_at"))
             self.tray_7d.setToolTip(
                 f"7-day weekly: {pct7:.0f}% — resets in {reset7}"
@@ -508,14 +543,15 @@ class Widget(QWidget):
         })
 
 
-def make_tray_pixmap(label: str, pct: float | None, size: int = 16) -> QPixmap:
+def make_tray_pixmap(pct: float | None, time_rem_pct: float | None,
+                     size: int = 16) -> QPixmap:
     """Render a tray icon natively at the requested size.
 
-    Design:
+    Design (v4 "dark + tinted number"):
       - dark rounded base
-      - severity-coloured bar fills the icon from the bottom by `pct`
-      - bold label on top with a dark outline so it stays readable
-        whether it lands over the dark base or the colored fill
+      - white perimeter arc shows `time_rem_pct` of the reset window remaining
+        (100 = just reset → full circle; 0 = imminent reset → empty)
+      - severity-coloured bold percentage in the center
     """
     pix = QPixmap(size, size)
     pix.fill(Qt.transparent)
@@ -530,43 +566,59 @@ def make_tray_pixmap(label: str, pct: float | None, size: int = 16) -> QPixmap:
     p.setBrush(QColor(40, 44, 52))
     p.drawRoundedRect(0, 0, size, size, radius, radius)
 
-    # Severity-colored fill from bottom (uses full vertical space)
-    if pct is not None:
-        v = max(0.0, min(100.0, pct))
-        fill_h = max(1 if v > 0 else 0, int(round(size * v / 100)))
-        if fill_h > 0:
-            p.setBrush(ring_color(v))
-            # Clip to the rounded rect so fill respects the rounding
-            p.save()
-            clip = QPainterPath()
-            clip.addRoundedRect(0, 0, size, size, radius, radius)
-            p.setClipPath(clip)
-            p.drawRect(0, size - fill_h, size, fill_h)
-            p.restore()
+    # Time-remaining arc (white)
+    thickness = max(1.5, size * 0.10)
+    inset = thickness / 2
+    arc_rect = QRectF(inset, inset, size - 2 * inset, size - 2 * inset)
+    p.setBrush(Qt.NoBrush)
+    p.setPen(QPen(QColor(60, 65, 75, 220), thickness,
+                  Qt.SolidLine, Qt.RoundCap))
+    p.drawArc(arc_rect, 0, 360 * 16)
+    if time_rem_pct is not None:
+        t = max(0.0, min(100.0, time_rem_pct))
+        p.setPen(QPen(QColor(245, 247, 252), thickness,
+                      Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(arc_rect, 90 * 16, int(-(t / 100.0) * 360 * 16))
 
-    # Label with manual outline for readability over any fill color
+    # Big urgency-coloured number with dark outline
+    if pct is None:
+        text, fill = "—", QColor(180, 185, 195)
+    else:
+        v = max(0.0, min(100.0, pct))
+        text, fill = f"{int(round(v))}", urgency_color(v, time_rem_pct)
     f = QFont()
     f.setBold(True)
-    f.setPointSizeF(size * 0.62)
+    f.setPointSizeF(size * 0.55)
     p.setFont(f)
     rect = QRectF(0, -1, size, size)
-    outline = QColor(0, 0, 0, 220)
-    p.setPen(outline)
+    p.setPen(QColor(0, 0, 0, 220))
     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-        p.drawText(rect.translated(dx, dy), Qt.AlignCenter, label)
-    p.setPen(QColor(245, 247, 252))
-    p.drawText(rect, Qt.AlignCenter, label)
+        p.drawText(rect.translated(dx, dy), Qt.AlignCenter, text)
+    p.setPen(fill)
+    p.drawText(rect, Qt.AlignCenter, text)
 
     p.end()
     return pix
 
 
-def make_tray_icon(label: str, pct: float | None) -> QIcon:
+def make_tray_icon(pct: float | None, time_rem_pct: float | None) -> QIcon:
     """Multi-resolution icon so Windows can pick the closest match without scaling."""
     icon = QIcon()
     for sz in (16, 20, 24, 32, 40, 48):
-        icon.addPixmap(make_tray_pixmap(label, pct, sz))
+        icon.addPixmap(make_tray_pixmap(pct, time_rem_pct, sz))
     return icon
+
+
+def time_remaining_pct(resets_at: str | None, window_seconds: int) -> float | None:
+    """Convert an ISO 8601 reset timestamp into "% of window still remaining"."""
+    if not resets_at:
+        return None
+    try:
+        dt = datetime.fromisoformat(resets_at)
+        rem = (dt - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, min(100.0, rem / window_seconds * 100.0))
+    except Exception:
+        return None
 
 
 def _wire_tray(tray: QSystemTrayIcon, widget: "Widget", app: QApplication) -> None:
@@ -589,8 +641,8 @@ def make_tray_icons(
     app: QApplication, widget: "Widget"
 ) -> tuple[QSystemTrayIcon, QSystemTrayIcon]:
     """Two side-by-side tray icons: 5h session on the left, 7d weekly on the right."""
-    tray_5h = QSystemTrayIcon(make_tray_icon("5H", None), app)
-    tray_7d = QSystemTrayIcon(make_tray_icon("7D", None), app)
+    tray_5h = QSystemTrayIcon(make_tray_icon(None, None), app)
+    tray_7d = QSystemTrayIcon(make_tray_icon(None, None), app)
     tray_5h.setToolTip("Claude Code — 5-hour session (loading…)")
     tray_7d.setToolTip("Claude Code — 7-day weekly (loading…)")
     _wire_tray(tray_5h, widget, app)
