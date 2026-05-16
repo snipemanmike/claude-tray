@@ -119,6 +119,20 @@ def read_token() -> str | None:
         return None
 
 
+def _credentials_expired() -> bool:
+    """True if the on-disk access token is past (or within 60s of) its expiry.
+
+    Used to decide whether *we* should refresh, or whether the 401 is more
+    likely a transient hiccup and we should leave Claude Code's tokens alone.
+    """
+    try:
+        data = json.loads(CREDS_PATH.read_text())
+        expires_at_ms = int(data["claudeAiOauth"]["expiresAt"])
+        return time.time() * 1000 > (expires_at_ms - 60_000)
+    except Exception:
+        return False
+
+
 def refresh_access_token() -> str | None:
     """Exchange the on-disk refresh_token for a new access_token.
 
@@ -552,12 +566,21 @@ class Widget(QWidget):
         if data is None and status != 401 and status != 403:
             data, status = fetch_usage_via_headers(self.token)
 
-        # 401/403 — try a one-shot token refresh and retry
+        # 401/403 — try to recover without stepping on Claude Code's refresh
         if data is None and status in (401, 403) and allow_refresh:
-            new_token = refresh_access_token()
-            if new_token:
-                self.token = new_token
+            # Step 1: maybe Claude Code already refreshed; re-read disk first.
+            disk_token = read_token()
+            if disk_token and disk_token != self.token:
+                self.token = disk_token
                 return self._fetch(allow_refresh=False)
+            # Step 2: only do our own refresh if the token is actually expired.
+            # This avoids rotating the refresh_token out from under Claude Code
+            # when our in-memory token is fine but the endpoint hiccuped.
+            if _credentials_expired():
+                new_token = refresh_access_token()
+                if new_token:
+                    self.token = new_token
+                    return self._fetch(allow_refresh=False)
 
         if data is not None:
             # Source of truth for "what worked this poll"

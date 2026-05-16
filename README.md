@@ -116,7 +116,12 @@ On a 429 from the primary, sends a minimum-cost message to `claude-haiku-4-5` an
 
 > **Why two paths?** `/api/oauth/usage` is undocumented and currently has an aggressive rate limit (see [anthropics/claude-code#31637](https://github.com/anthropics/claude-code/issues/31637) — polls as slow as 5 min can trip 429, and recovery can take 30+ min with no `Retry-After`). The header probe is bullet-proof but costs a tiny fraction of quota per call. The hybrid gets you free polling when the endpoint works and reliable polling when it doesn't. At 60 s polling, even worst-case "header probe every time" burns about **0.05 % of your 5 h quota over the full 5 h window** — basically noise.
 
-The OAuth access token expires every ~8–10 hours. On `401`/`403` the widget refreshes the token itself via `POST https://claude.ai/v1/oauth/token` using the on-disk `refreshToken` (same client_id Claude Code uses) and writes the rotated credentials back to `~/.claude/.credentials.json`, so Claude Code stays in sync too. No need to launch the CLI just to re-auth on cold boot.
+The OAuth access token expires every ~8–10 hours. The widget recovers without manual intervention:
+
+1. On `401` / `403`, first **re-read the file** in case Claude Code already refreshed (it usually has) — retry with that token.
+2. Only if the on-disk token is *actually* past its `expiresAt`, **do our own refresh** via `POST https://claude.ai/v1/oauth/token` (Claude Code's public OAuth client_id), and write the rotated credentials back to `~/.claude/.credentials.json` so Claude Code stays in sync.
+
+This minimizes the OAuth refresh race — whichever side calls refresh first invalidates the other's refresh_token, so we only refresh when nobody else has and the token is genuinely expired.
 
 ## The 16×16 tray-icon ceiling
 
