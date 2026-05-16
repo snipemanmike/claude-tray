@@ -821,11 +821,17 @@ class TaskbarWidget(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.reposition)
         self._timer.start(1500)
-        # Repaint ring/text every second so the countdowns stay live
+        # Repaint + re-assert topmost every second so any z-order disruption
+        # (e.g. clicking the overlay activates the floating widget, which
+        # demotes us in the topmost band) self-heals quickly.
         self._tick = QTimer(self)
-        self._tick.timeout.connect(self.update)
+        self._tick.timeout.connect(self._tick_update)
         self._tick.start(1000)
         QTimer.singleShot(50, self.reposition)
+
+    def _tick_update(self) -> None:
+        self.update()
+        self._force_topmost()
 
     def set_data(self, pct5, tr5, pct7, tr7) -> None:
         self._pct5, self._tr5 = pct5, tr5
@@ -887,9 +893,17 @@ class TaskbarWidget(QWidget):
     def mousePressEvent(self, e) -> None:
         if e.button() == Qt.LeftButton:
             self._on_click()
+            # The click activated whatever on_click toggled; reclaim topmost
+            # immediately + once more after Qt finishes processing so we don't
+            # get buried by the taskbar.
+            self._force_topmost()
+            QTimer.singleShot(50, self._force_topmost)
+            QTimer.singleShot(250, self._force_topmost)
             e.accept()
         elif e.button() == Qt.RightButton:
             self._show_menu(e.globalPosition().toPoint())
+            self._force_topmost()
+            QTimer.singleShot(50, self._force_topmost)
             e.accept()
 
     def _show_menu(self, gp: QPoint) -> None:
