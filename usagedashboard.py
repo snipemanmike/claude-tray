@@ -850,6 +850,27 @@ class TaskbarWidget(QWidget):
         self.move(x, y)
         if not self.isVisible():
             self.show()
+        self._force_topmost()
+
+    def _force_topmost(self) -> None:
+        """Re-rank above the taskbar (Shell_TrayWnd is HWND_TOPMOST too —
+        Qt's WindowStaysOnTopHint isn't always enough on its own)."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            HWND_TOPMOST = -1
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOACTIVATE = 0x0010
+            SWP_SHOWWINDOW = 0x0040
+            ctypes.windll.user32.SetWindowPos(
+                int(self.winId()), HWND_TOPMOST,
+                0, 0, 0, 0,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        except Exception:
+            pass
 
     def paintEvent(self, _e) -> None:
         p = QPainter(self)
