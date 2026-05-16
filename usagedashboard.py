@@ -57,6 +57,8 @@ POLL_SECONDS = 60        # 1 min — feasible because we fall back to header pro
 MAX_BACKOFF_SECONDS = 1800   # 30 min ceiling on OAuth-endpoint backoff
 HEADER_PROBE_MODEL = "claude-haiku-4-5-20251001"
 MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+TOKEN_URL = "https://claude.ai/v1/oauth/token"
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code public client_id
 USER_AGENT = "usagedashboard/1.0"
 
 # Visual palette
@@ -115,6 +117,54 @@ def read_token() -> str | None:
         return data["claudeAiOauth"]["accessToken"]
     except Exception:
         return None
+
+
+def refresh_access_token() -> str | None:
+    """Exchange the on-disk refresh_token for a new access_token.
+
+    Writes the new credentials back to ~/.claude/.credentials.json so the
+    Claude Code CLI/IDE pick up the same fresh token. Returns the new access
+    token on success, None on any failure (network, malformed creds, etc.).
+    """
+    try:
+        creds = json.loads(CREDS_PATH.read_text())
+        refresh_token = creds["claudeAiOauth"]["refreshToken"]
+    except Exception:
+        return None
+    try:
+        r = requests.post(
+            TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "client_id": OAUTH_CLIENT_ID,
+                "refresh_token": refresh_token,
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        payload = r.json()
+    except Exception:
+        return None
+    new_access = payload.get("access_token")
+    if not new_access:
+        return None
+    # Persist the rotated credentials. Best-effort — if the file is locked by
+    # Claude Code at the same instant we just keep the new token in memory.
+    try:
+        creds["claudeAiOauth"]["accessToken"] = new_access
+        creds["claudeAiOauth"]["refreshToken"] = (
+            payload.get("refresh_token") or refresh_token
+        )
+        # expires_in defaults to 10h (36000s) to match observed Claude lifetimes
+        creds["claudeAiOauth"]["expiresAt"] = (
+            int(time.time() * 1000) + int(payload.get("expires_in", 36000)) * 1000
+        )
+        CREDS_PATH.write_text(json.dumps(creds, indent=2))
+    except Exception:
+        pass
+    return new_access
 
 
 def fetch_usage(token: str) -> tuple[dict | None, int | None]:
@@ -373,40 +423,11 @@ class Widget(QWidget):
             self.update()
             return
 
-        now = time.time()
-        data: dict | None = None
-        status: int | None = None
-        used_oauth = False
-
-        # Primary: free OAuth metadata endpoint (unless we know it's locked)
-        if now >= self._oauth_skip_until:
-            data, status = fetch_usage(self.token)
-            used_oauth = True
-            if data is None and status == 429:
-                # Endpoint is throttled — skip it for the backoff window
-                self._backoff_steps += 1
-                delay = min(
-                    POLL_SECONDS * (2 ** (self._backoff_steps - 1)),
-                    MAX_BACKOFF_SECONDS,
-                )
-                self._oauth_skip_until = now + delay
-
-        # Fallback: header probe via a tiny Haiku ping (costs ~9 tokens)
-        if data is None:
-            data, status = fetch_usage_via_headers(self.token)
-            if data is not None:
-                self._last_method = "header probe"
-        elif used_oauth:
-            self._last_method = "oauth metadata"
-
+        data, status = self._fetch(allow_refresh=True)
         if data is None:
             self._handle_fetch_error(status)
             return
 
-        # Success — if OAuth was the source, clear its backoff
-        if used_oauth and self._backoff_steps:
-            self._backoff_steps = 0
-            self._oauth_skip_until = 0.0
         # Always keep the timer at the normal cadence on success
         self._timer.start(POLL_SECONDS * 1000)
         self.last_error = (
@@ -503,6 +524,49 @@ class Widget(QWidget):
         self._opacity = v
         self.setWindowOpacity(v)
         self._persist()
+
+    def _fetch(self, allow_refresh: bool) -> tuple[dict | None, int | None]:
+        """One end-to-end attempt: OAuth metadata → header probe → refresh-and-retry.
+
+        Caller passes allow_refresh=False on the recursive retry so we don't
+        loop indefinitely on a permanently revoked token.
+        """
+        now = time.time()
+        data: dict | None = None
+        status: int | None = None
+        used_oauth = False
+
+        # Primary: free OAuth metadata endpoint (unless we know it's locked)
+        if now >= self._oauth_skip_until:
+            data, status = fetch_usage(self.token)
+            used_oauth = True
+            if data is None and status == 429:
+                self._backoff_steps += 1
+                delay = min(
+                    POLL_SECONDS * (2 ** (self._backoff_steps - 1)),
+                    MAX_BACKOFF_SECONDS,
+                )
+                self._oauth_skip_until = now + delay
+
+        # Fallback: header probe via a tiny Haiku ping
+        if data is None and status != 401 and status != 403:
+            data, status = fetch_usage_via_headers(self.token)
+
+        # 401/403 — try a one-shot token refresh and retry
+        if data is None and status in (401, 403) and allow_refresh:
+            new_token = refresh_access_token()
+            if new_token:
+                self.token = new_token
+                return self._fetch(allow_refresh=False)
+
+        if data is not None:
+            # Source of truth for "what worked this poll"
+            self._last_method = "oauth metadata" if used_oauth else "header probe"
+            # Clear OAuth backoff state on a successful primary call
+            if used_oauth and self._backoff_steps:
+                self._backoff_steps = 0
+                self._oauth_skip_until = 0.0
+        return data, status
 
     def _handle_fetch_error(self, status: int | None) -> None:
         """Both primary + fallback failed. Stay on normal cadence; show why."""
