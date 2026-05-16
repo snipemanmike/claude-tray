@@ -10,7 +10,7 @@ Two side-by-side tray icons show your 5-hour session and 7-day weekly utilizatio
 
 - **Two tray icons** (`5H`, `7D`) rendered natively at 16×16 with a vertical fill bar that grows with utilization. Color shifts from green to amber (≥70%) to red (≥90%).
 - **Transparent always-on-top widget** with two ring gauges, percentages, and reset countdowns. Drag to move, scroll-wheel to resize, right-click for opacity / quit.
-- **Polls every 120 s** from the Claude Code OAuth usage endpoint with exponential backoff on 429 — no extra API key, no token cost.
+- **Polls every 60 s** with an OAuth + header-probe fallback strategy — primary path is free; the fallback costs ~9 tokens per call (negligible).
 - **Persists position, size, opacity, visibility** across restarts (`~/.claude/.usagedashboard.json`).
 - **Tray click toggles** the floating widget. Tray right-click for refresh / quit.
 - **Multi-monitor aware** — places itself on whichever screen your cursor is on; recovers gracefully if you save a position on a monitor you later disconnect.
@@ -66,21 +66,25 @@ Tray icons across four utilization scenarios (shown 8× upscaled):
 
 ## How it works
 
-Reads the OAuth access token Claude Code keeps at `~/.claude/.credentials.json`, then `GET`s `https://api.anthropic.com/api/oauth/usage` with that Bearer token and the `anthropic-beta: oauth-2025-04-20` header. The response shape:
+Reads the OAuth access token Claude Code keeps at `~/.claude/.credentials.json`. Two data sources, tried in order:
+
+**1. Primary — `/api/oauth/usage`** (free, no quota cost)
+A `GET` to `https://api.anthropic.com/api/oauth/usage` with the OAuth Bearer token and `anthropic-beta: oauth-2025-04-20`:
 
 ```json
 {
   "five_hour":  {"utilization": 12.0, "resets_at": "2026-05-16T11:40:00Z"},
   "seven_day":  {"utilization":  7.0, "resets_at": "2026-05-20T21:00:00Z"},
-  "seven_day_opus": null,
-  "seven_day_sonnet": {"utilization": 0.0, "resets_at": null},
-  "extra_usage": {...}
+  ...
 }
 ```
 
-The same percentages you see on [claude.ai/settings/usage](https://claude.ai/settings/usage). Polled once per minute.
+**2. Fallback — `max_tokens=1` Haiku ping** (~0.0002% of 5h quota per call)
+On a 429 from the primary, sends a minimum-cost message to `claude-haiku-4-5` and reads the response headers — `anthropic-ratelimit-unified-5h-utilization` and `-7d-utilization` give the same numbers. The widget remembers when OAuth was throttled and skips it during the backoff window to avoid wasting round-trips.
 
-> **Heads up:** `/api/oauth/usage` is an undocumented internal endpoint and currently has an aggressive rate limit (see [anthropics/claude-code#31637](https://github.com/anthropics/claude-code/issues/31637) — polls as slow as 5 min can still trip 429, and once locked the endpoint can stay 429 for 30+ minutes with no `Retry-After`). The widget handles this with exponential backoff: it keeps showing the last successful reading and notes `endpoint throttled — retry in N min` in the error strip. Once Anthropic relaxes the limit (or fixes the recovery behaviour), you can lower `POLL_SECONDS`.
+> **Why two paths?** `/api/oauth/usage` is undocumented and currently has an aggressive rate limit (see [anthropics/claude-code#31637](https://github.com/anthropics/claude-code/issues/31637) — polls as slow as 5 min can trip 429, and recovery can take 30+ min with no `Retry-After`). The header probe is bullet-proof but costs a tiny fraction of quota per call. The hybrid gets you free polling when the endpoint works and reliable polling when it doesn't. At 60 s polling, even worst-case "header probe every time" burns about **0.05 % of your 5 h quota over the full 5 h window** — basically noise.
+
+The OAuth token expires periodically; Claude Code itself refreshes it in `~/.claude/.credentials.json` whenever you use the CLI/IDE. As long as you keep using Claude Code, the widget stays authenticated.
 
 The OAuth token expires periodically; Claude Code itself refreshes the token in `~/.claude/.credentials.json` whenever you use the CLI/IDE. As long as you keep using Claude Code, the widget stays authenticated.
 

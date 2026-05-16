@@ -49,8 +49,10 @@ from PySide6.QtWidgets import (
 CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
 STATE_PATH = Path.home() / ".claude" / ".usagedashboard.json"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-POLL_SECONDS = 120       # 2 min — see https://github.com/anthropics/claude-code/issues/31637
-MAX_BACKOFF_SECONDS = 1800   # 30 min ceiling on 429 backoff
+POLL_SECONDS = 60        # 1 min — feasible because we fall back to header probe on 429
+MAX_BACKOFF_SECONDS = 1800   # 30 min ceiling on OAuth-endpoint backoff
+HEADER_PROBE_MODEL = "claude-haiku-4-5-20251001"
+MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 USER_AGENT = "usagedashboard/1.0"
 
 # Visual palette
@@ -91,7 +93,7 @@ def read_token() -> str | None:
 
 
 def fetch_usage(token: str) -> tuple[dict | None, int | None]:
-    """Returns (data, status_code). Status is None on network errors."""
+    """Hit the (free) OAuth metadata endpoint. Returns (data, status_code)."""
     try:
         r = requests.get(
             USAGE_URL,
@@ -105,6 +107,60 @@ def fetch_usage(token: str) -> tuple[dict | None, int | None]:
         if r.status_code == 200:
             return r.json(), 200
         return None, r.status_code
+    except Exception:
+        return None, None
+
+
+def fetch_usage_via_headers(token: str) -> tuple[dict | None, int | None]:
+    """Fallback: send a max_tokens=1 ping to Haiku, read rate-limit headers.
+
+    Costs ~9 tokens of your 5h quota per call (a tiny fraction of a percent).
+    Used when the OAuth metadata endpoint is throttled.
+    """
+    body = json.dumps({
+        "model": HEADER_PROBE_MODEL,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "."}],
+    })
+    try:
+        r = requests.post(
+            MESSAGES_URL,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "oauth-2025-04-20",
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+            },
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None, r.status_code
+        h = r.headers
+        five = h.get("anthropic-ratelimit-unified-5h-utilization")
+        seven = h.get("anthropic-ratelimit-unified-7d-utilization")
+        if five is None and seven is None:
+            return None, 200
+        def _iso(epoch: str | None) -> str | None:
+            if not epoch:
+                return None
+            try:
+                return datetime.fromtimestamp(
+                    int(epoch), timezone.utc).isoformat()
+            except Exception:
+                return None
+        data = {
+            "five_hour": {
+                "utilization": float(five) * 100 if five else None,
+                "resets_at": _iso(h.get("anthropic-ratelimit-unified-5h-reset")),
+            },
+            "seven_day": {
+                "utilization": float(seven) * 100 if seven else None,
+                "resets_at": _iso(h.get("anthropic-ratelimit-unified-7d-reset")),
+            },
+        }
+        return data, 200
     except Exception:
         return None, None
 
@@ -233,6 +289,8 @@ class Widget(QWidget):
         self._drag_offset: QPoint | None = None
         self._visible_pref: bool = bool(state.get("visible", True))
         self._backoff_steps: int = 0
+        self._oauth_skip_until: float = 0.0
+        self._last_method: str = ""
         self.tray_5h: QSystemTrayIcon | None = None
         self.tray_7d: QSystemTrayIcon | None = None
         self.setWindowTitle("Claude usage")
@@ -288,16 +346,46 @@ class Widget(QWidget):
             self.update()
             return
 
-        data, status = fetch_usage(self.token)
+        now = time.time()
+        data: dict | None = None
+        status: int | None = None
+        used_oauth = False
+
+        # Primary: free OAuth metadata endpoint (unless we know it's locked)
+        if now >= self._oauth_skip_until:
+            data, status = fetch_usage(self.token)
+            used_oauth = True
+            if data is None and status == 429:
+                # Endpoint is throttled — skip it for the backoff window
+                self._backoff_steps += 1
+                delay = min(
+                    POLL_SECONDS * (2 ** (self._backoff_steps - 1)),
+                    MAX_BACKOFF_SECONDS,
+                )
+                self._oauth_skip_until = now + delay
+
+        # Fallback: header probe via a tiny Haiku ping (costs ~9 tokens)
+        if data is None:
+            data, status = fetch_usage_via_headers(self.token)
+            if data is not None:
+                self._last_method = "header probe"
+        elif used_oauth:
+            self._last_method = "oauth metadata"
+
         if data is None:
             self._handle_fetch_error(status)
             return
 
-        # Success — clear backoff and resume normal cadence
-        if self._backoff_steps:
+        # Success — if OAuth was the source, clear its backoff
+        if used_oauth and self._backoff_steps:
             self._backoff_steps = 0
-            self._timer.start(POLL_SECONDS * 1000)
-        self.last_error = None
+            self._oauth_skip_until = 0.0
+        # Always keep the timer at the normal cadence on success
+        self._timer.start(POLL_SECONDS * 1000)
+        self.last_error = (
+            "using header probe (oauth throttled)"
+            if self._last_method == "header probe" else None
+        )
         self.last_fetch_ts = time.time()
 
         five = data.get("five_hour") or {}
@@ -388,24 +476,16 @@ class Widget(QWidget):
         self._persist()
 
     def _handle_fetch_error(self, status: int | None) -> None:
-        """Update error state and (if 429) schedule a longer retry."""
+        """Both primary + fallback failed. Stay on normal cadence; show why."""
         if status == 429:
-            self._backoff_steps += 1
-            delay = min(
-                POLL_SECONDS * (2 ** (self._backoff_steps - 1)),
-                MAX_BACKOFF_SECONDS,
-            )
-            self._timer.start(delay * 1000)
-            mins = delay // 60
-            self.last_error = f"endpoint throttled — retry in {mins} min"
+            self.last_error = "rate-limited (both endpoints) — retrying"
         elif status in (401, 403):
             self.last_error = "auth failed — open Claude Code to refresh"
         elif status is not None:
             self.last_error = f"HTTP {status}"
         else:
             self.last_error = "network error"
-        # Existing gauge values stay visible — last known reading is better
-        # than blanking the widget.
+        # Keep gauges showing the last good reading.
         self.update()
 
     def toggle_visible(self) -> None:
