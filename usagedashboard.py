@@ -232,7 +232,7 @@ class RingGauge:
         self.reset_label = fmt_reset(reset_iso)
 
     def paint(self, p: QPainter, rect: QRectF) -> None:
-        # Ring
+        # Ring drains with TIME REMAINING (matches the tray-icon behavior).
         size = min(rect.width(), rect.height() - 22)
         ring_rect = QRectF(
             rect.center().x() - size / 2,
@@ -241,32 +241,30 @@ class RingGauge:
             size,
         )
         thickness = max(6, size * 0.12)
-        pen_track = QPen(TRACK_COLOR, thickness, Qt.SolidLine, Qt.RoundCap)
-        p.setPen(pen_track)
-        p.setBrush(Qt.NoBrush)
-        p.drawArc(ring_rect.adjusted(thickness/2, thickness/2, -thickness/2, -thickness/2),
-                  0, 360 * 16)
-
-        pct = 0.0 if self.pct is None else max(0.0, min(100.0, self.pct))
-        pen_val = QPen(urgency_color(pct, self.time_rem_pct),
-                       thickness, Qt.SolidLine, Qt.RoundCap)
-        p.setPen(pen_val)
-        # Qt arcs: start at 3 o'clock (0°), positive = counter-clockwise.
-        # Start at 12 (90°), sweep clockwise (negative angle).
-        span = int(-pct / 100.0 * 360 * 16)
-        p.drawArc(
-            ring_rect.adjusted(thickness/2, thickness/2, -thickness/2, -thickness/2),
-            90 * 16,
-            span,
+        ring_inner = ring_rect.adjusted(
+            thickness / 2, thickness / 2, -thickness / 2, -thickness / 2
         )
 
-        # Center percentage
+        # Track
+        p.setPen(QPen(TRACK_COLOR, thickness, Qt.SolidLine, Qt.RoundCap))
+        p.setBrush(Qt.NoBrush)
+        p.drawArc(ring_inner, 0, 360 * 16)
+
+        # Time-remaining arc (white) — matches the tray icon
+        if self.time_rem_pct is not None:
+            t = max(0.0, min(100.0, self.time_rem_pct))
+            p.setPen(QPen(TEXT_COLOR, thickness, Qt.SolidLine, Qt.RoundCap))
+            # Start at 12 o'clock, sweep clockwise as time elapses
+            p.drawArc(ring_inner, 90 * 16, int(-(t / 100.0) * 360 * 16))
+
+        # Center percentage — coloured by urgency (matches tray number)
+        pct = 0.0 if self.pct is None else max(0.0, min(100.0, self.pct))
         font = QFont()
         font.setPointSizeF(max(10.0, size * 0.22))
         font.setBold(True)
         p.setFont(font)
-        p.setPen(TEXT_COLOR)
         text = "—" if self.pct is None else f"{int(round(pct))}%"
+        p.setPen(urgency_color(pct, self.time_rem_pct))
         p.drawText(ring_rect, Qt.AlignCenter, text)
 
         # Label above ring (small)

@@ -33,29 +33,26 @@ SUB = QColor(160, 165, 175)
 
 def _draw_ring(p: QPainter, rect: QRectF, label: str,
                pct: float, time_rem_pct: float, reset: str) -> None:
-    # Ring geometry — size based on rect width, leaving room for labels
+    # Same behavior as the tray: ring drains with time, number coloured by urgency.
     size = min(rect.width(), rect.height() - 22)
     ring = QRectF(rect.center().x() - size / 2, rect.top() + 4, size, size)
     thickness = max(6.0, size * 0.12)
+    inner = ring.adjusted(thickness/2, thickness/2, -thickness/2, -thickness/2)
 
     # Track
     p.setPen(QPen(TRACK, thickness, Qt.SolidLine, Qt.RoundCap))
     p.setBrush(Qt.NoBrush)
-    p.drawArc(ring.adjusted(thickness/2, thickness/2, -thickness/2, -thickness/2),
-              0, 360 * 16)
+    p.drawArc(inner, 0, 360 * 16)
 
-    # Value arc — colour from time-normalized urgency
+    # Time-remaining arc (white)
+    t = max(0.0, min(100.0, time_rem_pct))
+    p.setPen(QPen(TEXT, thickness, Qt.SolidLine, Qt.RoundCap))
+    p.drawArc(inner, 90 * 16, int(-(t / 100.0) * 360 * 16))
+
+    # % in centre, urgency-coloured
     v = max(0.0, min(100.0, pct))
-    p.setPen(QPen(urgency_color(v, time_rem_pct),
-                  thickness, Qt.SolidLine, Qt.RoundCap))
-    p.drawArc(
-        ring.adjusted(thickness/2, thickness/2, -thickness/2, -thickness/2),
-        90 * 16,
-        int(-v / 100.0 * 360 * 16),
-    )
-
     f = QFont(); f.setBold(True); f.setPointSizeF(max(10.0, size * 0.22))
-    p.setFont(f); p.setPen(TEXT)
+    p.setFont(f); p.setPen(urgency_color(v, time_rem_pct))
     p.drawText(ring, Qt.AlignCenter, f"{int(round(v))}%")
 
     sub = QFont(); sub.setPointSizeF(max(7.0, size * 0.10))
