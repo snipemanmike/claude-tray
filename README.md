@@ -8,19 +8,21 @@ Two side-by-side tray icons show your 5-hour session and 7-day weekly utilizatio
 
 ## The urgency color model
 
-Raw % is half the story. Being at 90 % with 4 hours left of a 5-hour window is a problem — you'll burn out before reset. Being at 90 % with 2 minutes left isn't — you'll reset to 0 in 2 minutes. Plain severity-by-% can't tell those apart, so the color is driven by a single formula:
+Raw % is half the story. Being at 90 % with 4 hours left of a 5-hour window is a problem — you'll burn out before reset. Being at 90 % with 2 minutes left isn't — you'll reset to 0 in 2 minutes. Plain severity-by-% can't tell those apart, so color is driven by a single formula:
 
 ```
 urgency = pct + time_remaining% − 100   (= pct − elapsed%)
 ```
 
-| urgency | meaning | color |
-|---|---|---|
-| **< 30** | on pace or ahead — you'll finish under quota | green |
-| **30 – 60** | burning faster than the reset can save you | amber |
-| **≥ 60** | catastrophic burn rate — will exhaust before reset | red |
+The color is a **continuous gradient**, not a step function — it slides smoothly from green at urgency 0, through peak amber at urgency 15, to pure red at urgency 40 and above. So small overshoots tint slightly amber; big ones go red.
 
-Both the tray icons and the widget rings use this function. The 3×3 map across `(pct × time_remaining)`:
+### The full curve
+
+![urgency curve](docs/urgency_curve.png)
+
+X = time remaining; Y = pct used. Each pixel is colored exactly as the tray icon / widget ring would be at that state. Dashed diagonals mark the gradient anchors (peak amber, pure red). The "danger zone" is the top-right corner — high % with a fresh window. The further from that corner, the safer.
+
+### 3 × 3 sample map
 
 ![urgency model](docs/urgency.png)
 

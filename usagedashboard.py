@@ -73,28 +73,52 @@ AMBER = QColor(235, 175,  60)
 GREEN = QColor(110, 200, 140)
 
 
+# Urgency-to-colour gradient anchors. Stricter than the original 30/60 step
+# function — amber appears as soon as you're slightly ahead of pace, and the
+# colour smoothly slides through amber to red over 0 → 40 urgency.
+URGENCY_AMBER_ANCHOR = 15.0    # urgency value at peak amber
+URGENCY_RED_ANCHOR   = 40.0    # urgency value at pure red (and beyond)
+
+
+def _lerp_color(c1: QColor, c2: QColor, t: float) -> QColor:
+    t = max(0.0, min(1.0, t))
+    return QColor(
+        int(round(c1.red()   + (c2.red()   - c1.red())   * t)),
+        int(round(c1.green() + (c2.green() - c1.green()) * t)),
+        int(round(c1.blue()  + (c2.blue()  - c1.blue())  * t)),
+    )
+
+
 def urgency_color(pct: float | None, time_rem_pct: float | None) -> QColor:
-    """Time-normalized severity color.
+    """Continuous-gradient severity color.
 
       urgency = pct + time_remaining% − 100   (= pct − elapsed%)
 
-      < 30  → green   (on pace or ahead of the reset clock)
-      30-59 → amber   (burning faster than reset can save you)
-      ≥ 60  → red     (catastrophic burn rate — will exhaust before reset)
+      ≤ 0 ........................ pure GREEN  (on pace or ahead)
+      0  →  URGENCY_AMBER_ANCHOR .. smoothly green→amber
+      AMBER →  URGENCY_RED_ANCHOR . smoothly amber→red
+      ≥ URGENCY_RED_ANCHOR ....... pure RED    (will exhaust before reset)
 
     If `time_rem_pct` is unavailable, falls back to raw % bucketing.
     """
     if pct is None:
         return GREEN
     if time_rem_pct is None:
-        # No time info — bucket by raw % using the same thresholds
         if pct >= 90: return RED
         if pct >= 70: return AMBER
         return GREEN
     urgency = pct + time_rem_pct - 100.0
-    if urgency >= 60: return RED
-    if urgency >= 30: return AMBER
-    return GREEN
+    if urgency <= 0:
+        return GREEN
+    if urgency >= URGENCY_RED_ANCHOR:
+        return RED
+    if urgency < URGENCY_AMBER_ANCHOR:
+        return _lerp_color(GREEN, AMBER, urgency / URGENCY_AMBER_ANCHOR)
+    return _lerp_color(
+        AMBER, RED,
+        (urgency - URGENCY_AMBER_ANCHOR) /
+        (URGENCY_RED_ANCHOR - URGENCY_AMBER_ANCHOR),
+    )
 
 
 def load_state() -> dict:
