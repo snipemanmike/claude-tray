@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt, QRectF
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication
 
-from usagedashboard import make_tray_pixmap, ring_color, urgency_color
+from usagedashboard import make_tray_pixmap, urgency_color
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +99,8 @@ def render_tray_strip(pairs: list[tuple[float, float, float, float]],
                       scale: int = 8,
                       gap: int = 6,
                       group_gap: int = 28) -> QPixmap:
-    """Show several (pct5, tr5, pct7, tr7) tuples as 5H/7D icon pairs."""
+    """Show several (pct5, tr5, pct7, tr7) tuples as side-by-side icon pairs
+    (left = 5h session, right = 7d weekly)."""
     base = 16
     icon = base * scale
     n = len(pairs)

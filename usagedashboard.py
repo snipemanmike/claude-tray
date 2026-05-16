@@ -1,14 +1,18 @@
 """
 Always-on Claude Code usage dashboard.
 
-Frameless transparent always-on-top window showing two ring gauges:
-  - 5-hour session utilization
-  - 7-day weekly utilization
+Two surfaces, same visual language:
+  - Two tray icons (5h session, 7d weekly) with the % in the centre
+    coloured by an urgency model (pct + time_remaining% − 100) and a
+    white perimeter ring that drains as the reset window elapses.
+  - Frameless transparent always-on-top widget mirroring the same ring
+    behaviour at a larger size, with reset countdowns and labels.
 
-Polls https://api.anthropic.com/api/oauth/usage using the OAuth token
-stored locally by Claude Code at ~/.claude/.credentials.json.
+Polls https://api.anthropic.com/api/oauth/usage with a max_tokens=1
+Haiku ping as fallback when the OAuth endpoint 429s. OAuth credential
+is read from ~/.claude/.credentials.json (refreshed by Claude Code).
 
-Drag with left mouse anywhere on the widget. Right-click for menu.
+Drag the widget with left mouse anywhere; right-click for menu.
 """
 
 from __future__ import annotations
@@ -67,36 +71,28 @@ AMBER = QColor(235, 175,  60)
 GREEN = QColor(110, 200, 140)
 
 
-def ring_color(score: float) -> QColor:
-    """Bucket a 0-100 score into the three severity colors."""
-    if score >= 90: return RED
-    if score >= 70: return AMBER
-    return GREEN
+def urgency_color(pct: float | None, time_rem_pct: float | None) -> QColor:
+    """Time-normalized severity color.
 
+      urgency = pct + time_remaining% − 100   (= pct − elapsed%)
 
-def urgency_score(pct: float | None, time_rem_pct: float | None) -> float:
-    """Time-normalized urgency: how much MORE of the quota you've used than
-    the fraction of the reset window that has elapsed.
+      < 30  → green   (on pace or ahead of the reset clock)
+      30-59 → amber   (burning faster than reset can save you)
+      ≥ 60  → red     (catastrophic burn rate — will exhaust before reset)
 
-      urgency = pct − (100 − time_rem_pct) = pct + time_rem_pct − 100
-
-    < 0: ahead of schedule (you'll finish under quota)
-      0: exactly on pace
-    > 0: burning faster than the reset can save you
-
-    Mapped to a 0-100 colour scale: 0 → green, 30 → amber, 60 → red.
+    If `time_rem_pct` is unavailable, falls back to raw % bucketing.
     """
     if pct is None:
-        return 0.0
+        return GREEN
     if time_rem_pct is None:
-        return pct  # No time info — fall back to raw severity
-    excess = pct + time_rem_pct - 100.0     # can be negative
-    # Scale so excess=60 hits 100 (red threshold), excess=42 hits 70 (amber)
-    return max(0.0, min(100.0, excess * (100.0 / 60.0)))
-
-
-def urgency_color(pct: float | None, time_rem_pct: float | None) -> QColor:
-    return ring_color(urgency_score(pct, time_rem_pct))
+        # No time info — bucket by raw % using the same thresholds
+        if pct >= 90: return RED
+        if pct >= 70: return AMBER
+        return GREEN
+    urgency = pct + time_rem_pct - 100.0
+    if urgency >= 60: return RED
+    if urgency >= 30: return AMBER
+    return GREEN
 
 
 def load_state() -> dict:
