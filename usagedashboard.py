@@ -377,6 +377,9 @@ class Widget(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_AlwaysShowToolTips, True)
+        # Don't steal focus when shown — otherwise the taskbar overlay gets
+        # demoted in the topmost band and the Windows taskbar paints over it.
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setMinimumSize(QSize(220, 130))
 
         self.gauge_5h = RingGauge("5h session")
@@ -556,6 +559,7 @@ class Widget(QWidget):
 
     def _show_menu(self, global_pos: QPoint) -> None:
         m = QMenu(self)
+        m.addAction("Hide widget", self.toggle_visible)
         m.addAction("Refresh now", self.refresh_now)
         m.addSeparator()
         for label, val in [("Opacity 50%", 0.5), ("Opacity 75%", 0.75),
@@ -816,14 +820,14 @@ class TaskbarWidget(QWidget):
         self._icon_size = 28
         self._gap = 4
 
-        # Re-position over the taskbar periodically — cheaper than a WinEventHook
-        # and handles taskbar autohide / DPI / monitor changes.
+        # Re-position over the taskbar — handles taskbar autohide / DPI /
+        # monitor changes. Cheap so we can poll fast.
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.reposition)
-        self._timer.start(1500)
+        self._timer.start(500)
         # Repaint + re-assert topmost every second so any z-order disruption
-        # (e.g. clicking the overlay activates the floating widget, which
-        # demotes us in the topmost band) self-heals quickly.
+        # (e.g. clicking the overlay activates something else and demotes us
+        # in the topmost band) self-heals quickly.
         self._tick = QTimer(self)
         self._tick.timeout.connect(self._tick_update)
         self._tick.start(1000)
@@ -854,8 +858,9 @@ class TaskbarWidget(QWidget):
         self._icon_size = icon
         self.resize(w, h)
         self.move(x, y)
-        if not self.isVisible():
-            self.show()
+        # Always show — isVisible() can lie when Qt's internal state has
+        # drifted from what the Windows shell actually displays.
+        self.show()
         self._force_topmost()
 
     def _force_topmost(self) -> None:
