@@ -120,10 +120,10 @@ def render_tray_strip(pairs: list[tuple[float, float, float, float]],
 
     x = group_gap
     for pct5, tr5, pct7, tr7 in pairs:
-        i5 = make_tray_pixmap(pct5, tr5, base).scaled(
+        i5 = make_tray_pixmap(pct5, tr5, base, marker="h").scaled(
             icon, icon, Qt.KeepAspectRatio, Qt.FastTransformation
         )
-        i7 = make_tray_pixmap(pct7, tr7, base).scaled(
+        i7 = make_tray_pixmap(pct7, tr7, base, marker="d").scaled(
             icon, icon, Qt.KeepAspectRatio, Qt.FastTransformation
         )
         y = 8
@@ -231,7 +231,7 @@ def render_urgency_explainer() -> QPixmap:
                    Qt.AlignRight | Qt.AlignVCenter, f"pct = {plabel}")
         for ci, (_, trp) in enumerate(times):
             x = side_w + ci * cell_w + (cell_w - icon) // 2
-            ic = make_tray_pixmap(pct, trp, icon_native).scaled(
+            ic = make_tray_pixmap(pct, trp, icon_native, marker="h").scaled(
                 icon, icon, Qt.KeepAspectRatio, Qt.FastTransformation)
             p.drawPixmap(x, y, ic)
     p.end()

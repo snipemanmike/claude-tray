@@ -462,14 +462,14 @@ class Widget(QWidget):
         tooltip = self._tooltip(data)
         self.setToolTip(tooltip)
         if self.tray_5h is not None:
-            self.tray_5h.setIcon(make_tray_icon(pct5, tr5))
+            self.tray_5h.setIcon(make_tray_icon(pct5, tr5, marker="h"))
             reset5 = fmt_reset(five.get("resets_at"))
             self.tray_5h.setToolTip(
                 f"5-hour session: {pct5:.0f}% — resets in {reset5}"
                 if pct5 is not None else "5-hour session: —"
             )
         if self.tray_7d is not None:
-            self.tray_7d.setIcon(make_tray_icon(pct7, tr7))
+            self.tray_7d.setIcon(make_tray_icon(pct7, tr7, marker="d"))
             reset7 = fmt_reset(seven.get("resets_at"))
             self.tray_7d.setToolTip(
                 f"7-day weekly: {pct7:.0f}% — resets in {reset7}"
@@ -625,14 +625,16 @@ class Widget(QWidget):
 
 
 def make_tray_pixmap(pct: float | None, time_rem_pct: float | None,
-                     size: int = 16) -> QPixmap:
+                     size: int = 16, marker: str | None = None) -> QPixmap:
     """Render a tray icon natively at the requested size.
 
-    Design (v4 "dark + tinted number"):
+    Design:
       - dark rounded base
       - white perimeter arc shows `time_rem_pct` of the reset window remaining
         (100 = just reset → full circle; 0 = imminent reset → empty)
       - severity-coloured bold percentage in the center
+      - optional `marker` letter in the bottom corner so the 5h and 7d
+        icons stay distinguishable even when Windows shuffles their order
     """
     pix = QPixmap(size, size)
     pix.fill(Qt.transparent)
@@ -678,15 +680,29 @@ def make_tray_pixmap(pct: float | None, time_rem_pct: float | None,
     p.setPen(fill)
     p.drawText(rect, Qt.AlignCenter, text)
 
+    # Tiny identity letter in the bottom-right corner (e.g. 'h' for 5h, 'd' for 7d)
+    if marker:
+        mf = QFont()
+        mf.setBold(True)
+        mf.setPointSizeF(size * 0.30)
+        p.setFont(mf)
+        marker_rect = QRectF(size * 0.55, size * 0.55, size * 0.45, size * 0.45)
+        p.setPen(QColor(0, 0, 0, 200))
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            p.drawText(marker_rect.translated(dx, dy), Qt.AlignCenter, marker)
+        p.setPen(QColor(220, 225, 235, 230))
+        p.drawText(marker_rect, Qt.AlignCenter, marker)
+
     p.end()
     return pix
 
 
-def make_tray_icon(pct: float | None, time_rem_pct: float | None) -> QIcon:
+def make_tray_icon(pct: float | None, time_rem_pct: float | None,
+                   marker: str | None = None) -> QIcon:
     """Multi-resolution icon so Windows can pick the closest match without scaling."""
     icon = QIcon()
     for sz in (16, 20, 24, 32, 40, 48):
-        icon.addPixmap(make_tray_pixmap(pct, time_rem_pct, sz))
+        icon.addPixmap(make_tray_pixmap(pct, time_rem_pct, sz, marker))
     return icon
 
 
@@ -722,8 +738,8 @@ def make_tray_icons(
     app: QApplication, widget: "Widget"
 ) -> tuple[QSystemTrayIcon, QSystemTrayIcon]:
     """Two side-by-side tray icons: 5h session on the left, 7d weekly on the right."""
-    tray_5h = QSystemTrayIcon(make_tray_icon(None, None), app)
-    tray_7d = QSystemTrayIcon(make_tray_icon(None, None), app)
+    tray_5h = QSystemTrayIcon(make_tray_icon(None, None, marker="h"), app)
+    tray_7d = QSystemTrayIcon(make_tray_icon(None, None, marker="d"), app)
     tray_5h.setToolTip("Claude Code — 5-hour session (loading…)")
     tray_7d.setToolTip("Claude Code — 7-day weekly (loading…)")
     _wire_tray(tray_5h, widget, app)
@@ -759,6 +775,14 @@ def main() -> int:
     # Keep references so the tray icons aren't garbage collected
     app._tray_5h = tray_5h  # type: ignore[attr-defined]
     app._tray_7d = tray_7d  # type: ignore[attr-defined]
+
+    # Explicitly hide tray icons before exit so Windows releases the slots
+    # instead of leaving phantom icons behind.
+    def _cleanup() -> None:
+        tray_5h.hide()
+        tray_7d.hide()
+    app.aboutToQuit.connect(_cleanup)
+
     return app.exec()
 
 
