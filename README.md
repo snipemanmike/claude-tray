@@ -39,11 +39,11 @@ The widget adds the obvious extras the tray slot can't fit: section labels ("5h 
 
 ## Features
 
-- **Two tray icons** rendered natively at 16×16 — bold percentage colored by urgency, white perimeter arc that drains with time.
-- **Transparent always-on-top widget** mirrors the tray rings at a readable size, adds labels and reset countdowns. Drag to move, scroll-wheel to resize, right-click for refresh / opacity / quit.
+- **In-taskbar overlay** — two large icons sized to the full taskbar height (~32 px) sit on top of the Windows taskbar just left of the tray notification area. Bold % colored by urgency, white perimeter arc draining with time. Way more readable than a 16×16 tray icon.
+- **Floating always-on-top widget** with two ring gauges, percentages and reset countdowns — clicked open from the taskbar overlay. Drag to move, scroll-wheel to resize, right-click for refresh / opacity / quit.
 - **Polls every 60 s** with a free OAuth endpoint + Haiku-header-probe fallback — total quota cost is ~0.05 % of your 5 h window even in the worst case.
 - **Persists position, size, opacity, visibility** across restarts (`~/.claude/.usagedashboard.json`).
-- **Tray click toggles** the floating widget. Right-click for menu.
+- **Click the taskbar overlay** to toggle the floating widget. Right-click for menu.
 - **Multi-monitor aware** — places itself on whichever screen your cursor is on; recovers gracefully if a previously-saved position is on a disconnected monitor.
 
 ## Install
@@ -125,9 +125,13 @@ The OAuth access token expires every ~8–10 hours. The widget recovers without 
 
 This minimizes the OAuth refresh race — whichever side calls refresh first invalidates the other's refresh_token, so we only refresh when nobody else has and the token is genuinely expired.
 
-## The 16×16 tray-icon ceiling
+## Why a taskbar overlay instead of tray icons
 
-Windows tray icons are limited to `SM_CXSMICON` (16×16 px at 100 % DPI, larger at higher DPI). The clock and Ink Workspace aren't tray icons — they're special shell widgets. We render natively at 16×16 (no downsample blur) and use two side-by-side slots — one for 5h, one for 7d — so each gets the full pixel budget. The pair is positionally identifiable (left = 5h, right = 7d); the tooltip names them on hover.
+`QSystemTrayIcon` is the standard Qt API for "thing in the tray" but it's hard-capped at 16×16 pixels per slot (`SM_CXSMICON`). That's barely enough room for two stacked characters. The clock, ink workspace, and "real" CodeZeno-style widgets aren't tray icons — they're regular Win32 windows positioned over the taskbar.
+
+We do the same: `FindWindow("Shell_TrayWnd")` to get the taskbar HWND, `FindWindowEx(..., "TrayNotifyWnd")` for the tray notification area, then create a frameless transparent always-on-top window and position it just left of the tray, sized to the full taskbar height (~32 px). We re-poll the taskbar geometry every ~1.5 s so the overlay follows the taskbar across autohide, DPI changes, and monitor disconnects.
+
+Result: each icon is ~30 px tall instead of 16, so the percentage number is readable without squinting.
 
 ## Configuration
 

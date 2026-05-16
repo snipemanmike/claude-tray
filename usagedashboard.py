@@ -408,6 +408,7 @@ class Widget(QWidget):
         self._last_method: str = ""
         self.tray_5h: QSystemTrayIcon | None = None
         self.tray_7d: QSystemTrayIcon | None = None
+        self.taskbar: TaskbarWidget | None = None
         self.setWindowTitle("Claude usage")
 
         self._timer = QTimer(self)
@@ -485,16 +486,24 @@ class Widget(QWidget):
 
         tooltip = self._tooltip(data)
         self.setToolTip(tooltip)
+        reset5 = fmt_reset(five.get("resets_at"))
+        reset7 = fmt_reset(seven.get("resets_at"))
+        if self.taskbar is not None:
+            self.taskbar.set_data(pct5, tr5, pct7, tr7)
+            tip = []
+            if pct5 is not None:
+                tip.append(f"5-hour session: {pct5:.0f}% — resets in {reset5}")
+            if pct7 is not None:
+                tip.append(f"7-day weekly: {pct7:.0f}% — resets in {reset7}")
+            self.taskbar.setToolTip("\n".join(tip) or "loading…")
         if self.tray_5h is not None:
             self.tray_5h.setIcon(make_tray_icon(pct5, tr5, marker="h"))
-            reset5 = fmt_reset(five.get("resets_at"))
             self.tray_5h.setToolTip(
                 f"5-hour session: {pct5:.0f}% — resets in {reset5}"
                 if pct5 is not None else "5-hour session: —"
             )
         if self.tray_7d is not None:
             self.tray_7d.setIcon(make_tray_icon(pct7, tr7, marker="d"))
-            reset7 = fmt_reset(seven.get("resets_at"))
             self.tray_7d.setToolTip(
                 f"7-day weekly: {pct7:.0f}% — resets in {reset7}"
                 if pct7 is not None else "7-day weekly: —"
@@ -742,6 +751,136 @@ def time_remaining_pct(resets_at: str | None, window_seconds: int) -> float | No
         return None
 
 
+# ----------------------------------------------------------------------------
+# Taskbar overlay widget — a frameless window positioned over the shell taskbar
+# so we get the full taskbar height (~32-40px) instead of the 16x16 tray slot.
+# ----------------------------------------------------------------------------
+
+def _taskbar_geometry() -> tuple[int, int, int, int, int, int] | None:
+    """Return (taskbar_left, top, right, bottom, tray_left, tray_top) on
+    Windows, or None on other platforms / failure.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        u.FindWindowW.restype = wintypes.HWND
+        u.FindWindowExW.restype = wintypes.HWND
+        u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        u.GetWindowRect.restype = wintypes.BOOL
+
+        taskbar = u.FindWindowW("Shell_TrayWnd", None)
+        if not taskbar:
+            return None
+        tb = wintypes.RECT()
+        if not u.GetWindowRect(taskbar, ctypes.byref(tb)):
+            return None
+        tray = u.FindWindowExW(taskbar, None, "TrayNotifyWnd", None)
+        tr = wintypes.RECT()
+        if tray and u.GetWindowRect(tray, ctypes.byref(tr)):
+            tray_left, tray_top = tr.left, tr.top
+        else:
+            tray_left, tray_top = tb.right, tb.top
+        return tb.left, tb.top, tb.right, tb.bottom, tray_left, tray_top
+    except Exception:
+        return None
+
+
+class TaskbarWidget(QWidget):
+    """Frameless transparent always-on-top window that sits on top of the
+    Windows taskbar, just to the left of the tray notification area. Shows
+    the same two ring-icons we render for the tray, but at full taskbar
+    height so they're actually readable.
+    """
+
+    def __init__(self, on_click) -> None:
+        super().__init__(
+            None,
+            Qt.FramelessWindowHint
+            | Qt.Tool
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+            | Qt.NoDropShadowWindowHint,
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setWindowTitle("Claude usage (taskbar)")
+
+        self._on_click = on_click
+        self._pct5: float | None = None
+        self._tr5: float | None = None
+        self._pct7: float | None = None
+        self._tr7: float | None = None
+        self._icon_size = 28
+        self._gap = 4
+
+        # Re-position over the taskbar periodically — cheaper than a WinEventHook
+        # and handles taskbar autohide / DPI / monitor changes.
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.reposition)
+        self._timer.start(1500)
+        # Repaint ring/text every second so the countdowns stay live
+        self._tick = QTimer(self)
+        self._tick.timeout.connect(self.update)
+        self._tick.start(1000)
+        QTimer.singleShot(50, self.reposition)
+
+    def set_data(self, pct5, tr5, pct7, tr7) -> None:
+        self._pct5, self._tr5 = pct5, tr5
+        self._pct7, self._tr7 = pct7, tr7
+        self.update()
+
+    def reposition(self) -> None:
+        geo = _taskbar_geometry()
+        if not geo:
+            return
+        tb_l, tb_t, tb_r, tb_b, tray_l, tray_t = geo
+        tb_h = tb_b - tb_t
+        # Two square icons sized to fit the taskbar height
+        icon = max(20, tb_h - 6)
+        w = icon * 2 + self._gap
+        h = icon
+        # Slot ourselves just left of the tray notification area
+        x = tray_l - w - 6
+        y = tb_t + (tb_h - h) // 2
+        self._icon_size = icon
+        self.resize(w, h)
+        self.move(x, y)
+        if not self.isVisible():
+            self.show()
+
+    def paintEvent(self, _e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        s = self._icon_size
+        i5 = make_tray_pixmap(self._pct5, self._tr5, s, marker="h")
+        i7 = make_tray_pixmap(self._pct7, self._tr7, s, marker="d")
+        p.drawPixmap(0, 0, i5)
+        p.drawPixmap(s + self._gap, 0, i7)
+        p.end()
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.LeftButton:
+            self._on_click()
+            e.accept()
+        elif e.button() == Qt.RightButton:
+            self._show_menu(e.globalPosition().toPoint())
+            e.accept()
+
+    def _show_menu(self, gp: QPoint) -> None:
+        m = QMenu()
+        m.addAction("Show / hide widget", self._on_click)
+        m.addAction("Refresh now",
+                    lambda: QApplication.instance()._refresh_now())
+        m.addSeparator()
+        m.addAction("Quit", QApplication.instance().quit)
+        m.exec(gp)
+
+
 def _wire_tray(tray: QSystemTrayIcon, widget: "Widget", app: QApplication) -> None:
     menu = QMenu()
     show_hide = QAction("Show / hide widget", menu)
@@ -791,20 +930,19 @@ def main() -> int:
     app.setOrganizationName("local")
     app.setQuitOnLastWindowClosed(False)
     w = Widget()
-    tray_5h, tray_7d = make_tray_icons(app, w)
-    w.tray_5h = tray_5h
-    w.tray_7d = tray_7d
+
+    # In-taskbar overlay (Windows only). Left-click toggles the floating widget.
+    taskbar = TaskbarWidget(on_click=w.toggle_visible)
+    w.taskbar = taskbar
+    app._taskbar = taskbar  # keep alive  # type: ignore[attr-defined]
+    # Expose refresh on the QApplication so the taskbar right-click menu can hit it
+    app._refresh_now = w.refresh_now  # type: ignore[attr-defined]
+
     if w._visible_pref:
         w.show()
-    # Keep references so the tray icons aren't garbage collected
-    app._tray_5h = tray_5h  # type: ignore[attr-defined]
-    app._tray_7d = tray_7d  # type: ignore[attr-defined]
 
-    # Explicitly hide tray icons before exit so Windows releases the slots
-    # instead of leaving phantom icons behind.
     def _cleanup() -> None:
-        tray_5h.hide()
-        tray_7d.hide()
+        taskbar.hide()
     app.aboutToQuit.connect(_cleanup)
 
     return app.exec()
