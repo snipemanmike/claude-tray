@@ -6,3 +6,9 @@ venv/
 .idea/
 .vscode/
 *.log
+
+# Ad-hoc screenshots/previews captured during dev — do not commit
+tray_v*.png
+widget_v*.png
+screenshot*.png
+previews*.png
