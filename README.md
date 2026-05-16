@@ -10,7 +10,7 @@ Two side-by-side tray icons show your 5-hour session and 7-day weekly utilizatio
 
 - **Two tray icons** (`5H`, `7D`) rendered natively at 16×16 with a vertical fill bar that grows with utilization. Color shifts from green to amber (≥70%) to red (≥90%).
 - **Transparent always-on-top widget** with two ring gauges, percentages, and reset countdowns. Drag to move, scroll-wheel to resize, right-click for opacity / quit.
-- **Polls every 60 s** from the Claude Code OAuth usage endpoint — no extra API key, no token cost.
+- **Polls every 120 s** from the Claude Code OAuth usage endpoint with exponential backoff on 429 — no extra API key, no token cost.
 - **Persists position, size, opacity, visibility** across restarts (`~/.claude/.usagedashboard.json`).
 - **Tray click toggles** the floating widget. Tray right-click for refresh / quit.
 - **Multi-monitor aware** — places itself on whichever screen your cursor is on; recovers gracefully if you save a position on a monitor you later disconnect.
@@ -80,7 +80,7 @@ Reads the OAuth access token Claude Code keeps at `~/.claude/.credentials.json`,
 
 The same percentages you see on [claude.ai/settings/usage](https://claude.ai/settings/usage). Polled once per minute.
 
-> **Heads up:** `/api/oauth/usage` is an undocumented internal endpoint. It's been stable since Claude Code shipped subscription auth, but Anthropic could change or remove it without notice. If polling starts failing, the widget shows "fetch failed" — open an issue.
+> **Heads up:** `/api/oauth/usage` is an undocumented internal endpoint and currently has an aggressive rate limit (see [anthropics/claude-code#31637](https://github.com/anthropics/claude-code/issues/31637) — polls as slow as 5 min can still trip 429, and once locked the endpoint can stay 429 for 30+ minutes with no `Retry-After`). The widget handles this with exponential backoff: it keeps showing the last successful reading and notes `endpoint throttled — retry in N min` in the error strip. Once Anthropic relaxes the limit (or fixes the recovery behaviour), you can lower `POLL_SECONDS`.
 
 The OAuth token expires periodically; Claude Code itself refreshes the token in `~/.claude/.credentials.json` whenever you use the CLI/IDE. As long as you keep using Claude Code, the widget stays authenticated.
 

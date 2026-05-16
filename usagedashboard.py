@@ -49,7 +49,8 @@ from PySide6.QtWidgets import (
 CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
 STATE_PATH = Path.home() / ".claude" / ".usagedashboard.json"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-POLL_SECONDS = 60  # 1 min — the OAuth usage endpoint is metadata, not billed
+POLL_SECONDS = 120       # 2 min — see https://github.com/anthropics/claude-code/issues/31637
+MAX_BACKOFF_SECONDS = 1800   # 30 min ceiling on 429 backoff
 USER_AGENT = "usagedashboard/1.0"
 
 # Visual palette
@@ -89,8 +90,8 @@ def read_token() -> str | None:
         return None
 
 
-def fetch_usage(token: str) -> dict | None:
-    """Returns dict with five_hour/seven_day/etc. or None on failure."""
+def fetch_usage(token: str) -> tuple[dict | None, int | None]:
+    """Returns (data, status_code). Status is None on network errors."""
     try:
         r = requests.get(
             USAGE_URL,
@@ -102,10 +103,10 @@ def fetch_usage(token: str) -> dict | None:
             timeout=10,
         )
         if r.status_code == 200:
-            return r.json()
+            return r.json(), 200
+        return None, r.status_code
     except Exception:
-        return None
-    return None
+        return None, None
 
 
 def fmt_reset(iso: str | None) -> str:
@@ -231,6 +232,7 @@ class Widget(QWidget):
 
         self._drag_offset: QPoint | None = None
         self._visible_pref: bool = bool(state.get("visible", True))
+        self._backoff_steps: int = 0
         self.tray_5h: QSystemTrayIcon | None = None
         self.tray_7d: QSystemTrayIcon | None = None
         self.setWindowTitle("Claude usage")
@@ -286,12 +288,15 @@ class Widget(QWidget):
             self.update()
             return
 
-        data = fetch_usage(self.token)
+        data, status = fetch_usage(self.token)
         if data is None:
-            self.last_error = "fetch failed (network/auth)"
-            self.update()
+            self._handle_fetch_error(status)
             return
 
+        # Success — clear backoff and resume normal cadence
+        if self._backoff_steps:
+            self._backoff_steps = 0
+            self._timer.start(POLL_SECONDS * 1000)
         self.last_error = None
         self.last_fetch_ts = time.time()
 
@@ -381,6 +386,27 @@ class Widget(QWidget):
         self._opacity = v
         self.setWindowOpacity(v)
         self._persist()
+
+    def _handle_fetch_error(self, status: int | None) -> None:
+        """Update error state and (if 429) schedule a longer retry."""
+        if status == 429:
+            self._backoff_steps += 1
+            delay = min(
+                POLL_SECONDS * (2 ** (self._backoff_steps - 1)),
+                MAX_BACKOFF_SECONDS,
+            )
+            self._timer.start(delay * 1000)
+            mins = delay // 60
+            self.last_error = f"endpoint throttled — retry in {mins} min"
+        elif status in (401, 403):
+            self.last_error = "auth failed — open Claude Code to refresh"
+        elif status is not None:
+            self.last_error = f"HTTP {status}"
+        else:
+            self.last_error = "network error"
+        # Existing gauge values stay visible — last known reading is better
+        # than blanking the widget.
+        self.update()
 
     def toggle_visible(self) -> None:
         self._visible_pref = not self.isVisible()
