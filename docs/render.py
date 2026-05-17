@@ -269,11 +269,11 @@ def render_urgency_explainer() -> QPixmap:
     title = QFont(); title.setBold(True); title.setPointSizeF(11)
     p.setFont(title); p.setPen(QColor(235, 235, 245))
     p.drawText(QRectF(20, 14, W - 40, 22), Qt.AlignLeft,
-               "urgency = pct + time_remaining% − 100  (scaled to color bands)")
+               "urgency = pct + time_remaining% − 100  (4-stop color gradient)")
     sm = QFont(); sm.setPointSizeF(8)
     p.setFont(sm); p.setPen(QColor(160, 165, 180))
     p.drawText(QRectF(20, 32, W - 40, 18), Qt.AlignLeft,
-               "low % stays green regardless of time; high % only goes red when there's lots of window left")
+               "blue = under-utilizing, green = on pace, amber = burning fast, red = will exhaust")
 
     # Column headers
     p.setFont(title); p.setPen(QColor(200, 205, 215))

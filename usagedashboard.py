@@ -68,16 +68,17 @@ TEXT_COLOR = QColor(235, 235, 240)
 SUB_COLOR = QColor(160, 165, 175)
 
 # Severity colors keyed by an urgency band.
-RED   = QColor(235,  80,  80)
-AMBER = QColor(235, 175,  60)
-GREEN = QColor(110, 200, 140)
+BLUE  = QColor( 95, 175, 240)   # under-utilizing — plenty of headroom
+GREEN = QColor(110, 200, 140)   # on pace — maximizing compute-to-cost
+AMBER = QColor(235, 175,  60)   # burning faster than reset can save you
+RED   = QColor(235,  80,  80)   # will exhaust before the window resets
 
 
-# Urgency-to-colour gradient anchors. Stricter than the original 30/60 step
-# function — amber appears as soon as you're slightly ahead of pace, and the
-# colour smoothly slides through amber to red over 0 → 40 urgency.
-URGENCY_AMBER_ANCHOR = 15.0    # urgency value at peak amber
-URGENCY_RED_ANCHOR   = 40.0    # urgency value at pure red (and beyond)
+# Urgency-to-colour gradient anchors. The diagonals on the (time_rem, pct)
+# plane are pct + time_rem = constant. urgency = pct + time_rem − 100.
+URGENCY_BLUE_ANCHOR  = -25.0   # pct + time_remaining = 75 — under-utilizing
+URGENCY_AMBER_ANCHOR =  15.0   # urgency value at peak amber
+URGENCY_RED_ANCHOR   =  40.0   # urgency value at pure red (and beyond)
 
 
 def _lerp_color(c1: QColor, c2: QColor, t: float) -> QColor:
@@ -90,13 +91,15 @@ def _lerp_color(c1: QColor, c2: QColor, t: float) -> QColor:
 
 
 def urgency_color(pct: float | None, time_rem_pct: float | None) -> QColor:
-    """Continuous-gradient severity color.
+    """Continuous-gradient severity color along the urgency axis.
 
       urgency = pct + time_remaining% − 100   (= pct − elapsed%)
 
-      ≤ 0 ........................ pure GREEN  (on pace or ahead)
-      0  →  URGENCY_AMBER_ANCHOR .. smoothly green→amber
-      AMBER →  URGENCY_RED_ANCHOR . smoothly amber→red
+      ≤ URGENCY_BLUE_ANCHOR ...... pure BLUE   (under-utilizing — slack on the table)
+      BLUE → 0 .................. smoothly blue→green
+      = 0 ........................ pure GREEN  (on pace — maximizing compute/cost)
+      0 → URGENCY_AMBER_ANCHOR ... smoothly green→amber
+      AMBER → URGENCY_RED_ANCHOR . smoothly amber→red
       ≥ URGENCY_RED_ANCHOR ....... pure RED    (will exhaust before reset)
 
     If `time_rem_pct` is unavailable, falls back to raw % bucketing.
@@ -106,18 +109,25 @@ def urgency_color(pct: float | None, time_rem_pct: float | None) -> QColor:
     if time_rem_pct is None:
         if pct >= 90: return RED
         if pct >= 70: return AMBER
+        if pct <= 10: return BLUE
         return GREEN
     urgency = pct + time_rem_pct - 100.0
-    if urgency <= 0:
-        return GREEN
     if urgency >= URGENCY_RED_ANCHOR:
         return RED
-    if urgency < URGENCY_AMBER_ANCHOR:
+    if urgency <= URGENCY_BLUE_ANCHOR:
+        return BLUE
+    if urgency >= URGENCY_AMBER_ANCHOR:
+        return _lerp_color(
+            AMBER, RED,
+            (urgency - URGENCY_AMBER_ANCHOR) /
+            (URGENCY_RED_ANCHOR - URGENCY_AMBER_ANCHOR),
+        )
+    if urgency >= 0:
         return _lerp_color(GREEN, AMBER, urgency / URGENCY_AMBER_ANCHOR)
+    # urgency in (BLUE_ANCHOR, 0): blue → green
     return _lerp_color(
-        AMBER, RED,
-        (urgency - URGENCY_AMBER_ANCHOR) /
-        (URGENCY_RED_ANCHOR - URGENCY_AMBER_ANCHOR),
+        BLUE, GREEN,
+        (urgency - URGENCY_BLUE_ANCHOR) / (0.0 - URGENCY_BLUE_ANCHOR),
     )
 
 

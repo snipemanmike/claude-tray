@@ -17,7 +17,8 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication
 
 from usagedashboard import (
-    urgency_color, URGENCY_AMBER_ANCHOR, URGENCY_RED_ANCHOR,
+    urgency_color,
+    URGENCY_BLUE_ANCHOR, URGENCY_AMBER_ANCHOR, URGENCY_RED_ANCHOR,
 )
 
 
@@ -27,7 +28,8 @@ SUB   = QColor(160, 165, 180)
 GRID  = QColor(255, 255, 255, 45)
 
 
-def render_heatmap(amber: float = URGENCY_AMBER_ANCHOR,
+def render_heatmap(blue: float = URGENCY_BLUE_ANCHOR,
+                   amber: float = URGENCY_AMBER_ANCHOR,
                    red: float = URGENCY_RED_ANCHOR,
                    title: str = "", cell_px: int = 5) -> QPixmap:
     """Render a 100x100 grid coloured by the live urgency_color function."""
@@ -60,11 +62,24 @@ def render_heatmap(amber: float = URGENCY_AMBER_ANCHOR,
                 cell_px, cell_px, c,
             )
 
-    # Mark the two gradient anchor diagonals (where peak amber and pure red live).
+    # Mark the gradient anchor diagonals (where each pure color lives).
+    # pct + time_rem - 100 = urgency  →  pct = 100 - tr + urgency
+    # Boundary line crosses (tr=urgency, pct=100) and (tr=100, pct=urgency)
+    # For the blue anchor (negative urgency), it crosses (tr=0, pct=100+urgency=75)
+    # and (tr=100-|urgency|, pct=0).
     def chart_xy(tr_, pct_):
         return QPointF(pad_l + tr_ * cell_px,
                        pad_t + (grid - pct_) * cell_px)
     p.setPen(QPen(QColor(0, 0, 0, 160), 1.2, Qt.DashLine))
+    # Blue anchor: pct + tr = 100 + blue (which is negative, so 75)
+    if blue is not None:
+        sum_val = 100.0 + blue  # e.g. -25 → 75
+        if 0 < sum_val < 200:
+            # endpoints inside chart: (tr=0, pct=sum_val) and (tr=sum_val, pct=0)
+            a = chart_xy(max(0, sum_val - 100), min(100, sum_val))
+            b = chart_xy(min(100, sum_val), max(0, sum_val - 100))
+            p.drawLine(a, b)
+    # Amber + red anchors (positive urgencies)
     for thr in (amber, red):
         if 0 <= thr <= 100:
             p.drawLine(chart_xy(thr, 100), chart_xy(100, thr))
@@ -107,8 +122,8 @@ def render_heatmap(amber: float = URGENCY_AMBER_ANCHOR,
     p.setPen(SUB)
     p.drawText(QRectF(pad_l, legend_y, chart_w, 16), Qt.AlignLeft,
                f"urgency = pct + time_remaining − 100   |   "
-               f"green ≤ 0 → smooth → peak amber at {amber:g} → "
-               f"pure red at {red:g}   (dashed lines = anchors)")
+               f"blue ≤ {blue:g} → green at 0 → amber at {amber:g} → "
+               f"red at {red:g}   (dashed lines = gradient anchors)")
     p.end()
     return pix
 
@@ -117,8 +132,9 @@ def main():
     app = QApplication.instance() or QApplication(sys.argv)
     out = Path(__file__).resolve().parent
     title = (
-        f"continuous gradient  (peak amber at urgency = "
-        f"{URGENCY_AMBER_ANCHOR:g}, pure red at {URGENCY_RED_ANCHOR:g})"
+        f"continuous gradient  "
+        f"(blue ≤ {URGENCY_BLUE_ANCHOR:g}, green at 0, "
+        f"amber at {URGENCY_AMBER_ANCHOR:g}, red at {URGENCY_RED_ANCHOR:g})"
     )
     render_heatmap(title=title).save(str(out / "urgency_curve.png"))
     print("saved urgency_curve.png")

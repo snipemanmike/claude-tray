@@ -14,26 +14,37 @@ Raw % is half the story. Being at 90 % with 4 hours left of a 5-hour window is a
 urgency = pct + time_remaining% − 100   (= pct − elapsed%)
 ```
 
-The color is a **continuous gradient**, not a step function — it slides smoothly from green at urgency 0, through peak amber at urgency 15, to pure red at urgency 40 and above. So small overshoots tint slightly amber; big ones go red.
+The color is a **continuous 4-stop gradient**, not a step function. Each color carries a semantic:
+
+| anchor | urgency | meaning |
+|---|---|---|
+| **blue** | ≤ −25 | under-utilizing — plenty of headroom, slack on the table |
+| **green** | 0 | on pace — maximizing your compute-to-cost |
+| **amber** | 15 | burning faster than the reset can save you |
+| **red** | ≥ 40 | catastrophic — will exhaust before the window resets |
+
+Between anchors the color smoothly interpolates. The two diagonals `pct + time_remaining = 75` (blue anchor) and `pct + time_remaining = 115` (amber) and `= 140` (red) are *parallel* — they're all `pct = constant − time_remaining`, just at different intercepts.
+
+If you're someone who *wants* to maximize utilization (use everything you paid for), aim to keep the icons green — drifting blue means you could be doing more work.
 
 ### The full curve
 
 ![urgency curve](docs/urgency_curve.png)
 
-X = time remaining; Y = pct used. Each pixel is colored exactly as the tray icon / widget ring would be at that state. Dashed diagonals mark the gradient anchors (peak amber, pure red). The "danger zone" is the top-right corner — high % with a fresh window. The further from that corner, the safer.
+X = time remaining; Y = pct used. Each pixel is colored exactly as the tray icon / widget ring would be at that state. Dashed diagonals mark the four anchor lines (blue / green / amber / red). Top-right corner = high % with a fresh window = the danger zone (red). Bottom-left corner = low % and reset is approaching = blue (you didn't use what you had). Middle diagonal = green = on pace.
 
 ### 3 × 3 sample map
 
 ![urgency model](docs/urgency.png)
 
-**Low % stays green regardless of time.** **High % only goes red when there's lots of window left.** The bottom-right cell (92 % at 5 % time remaining) is green because the reset is right there — you made it.
+The rows are **8 % / 50 % / 92 %** used; the columns are **fresh window / half window / imminent reset**. Notice how the bottom-right cell (92 % at 5 % time remaining) stays green — you made it. And the top-left cell (8 % at 5 % time remaining) is blue — you barely used your quota.
 
 ## Visual language
 
 The same two visual elements appear in both surfaces:
 
 - **White ring / arc** drains as the reset window elapses — full circle just after a reset, gone right before the next one.
-- **Big bold percentage number** colored by urgency — green / amber / red.
+- **Big bold percentage number** colored by urgency — blue / green / amber / red.
 
 The widget adds the obvious extras the tray slot can't fit: section labels ("5h session" / "7d weekly") and reset countdowns ("resets 2h 18m").
 
