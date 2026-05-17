@@ -819,24 +819,27 @@ class TaskbarWidget(QWidget):
         self._tr7: float | None = None
         self._icon_size = 28
         self._gap = 4
+        self._embedded = False        # True once SetParent into Shell_TrayWnd succeeded
+        self._taskbar_hwnd: int = 0   # cached parent HWND so we can detect explorer restarts
 
-        # Re-position over the taskbar — handles taskbar autohide / DPI /
-        # monitor changes. Heavier (FindWindow + GetWindowRect), so slower cadence.
+        # Re-position over the taskbar — handles autohide / DPI / monitor /
+        # explorer-restart. Once we're a child of Shell_TrayWnd we can't be
+        # demoted, so the cadence can be relaxed.
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.reposition)
         self._timer.start(1000)
-        # Hot poll: re-assert HWND_TOPMOST very fast so clicking ANYWHERE on
-        # the taskbar (which activates Shell_TrayWnd and demotes us) can't
-        # bury us for more than ~50ms. SetWindowPos with NOSIZE+NOMOVE is
-        # near-free (~5-10 microseconds), so 20 Hz is negligible CPU.
-        self._topmost_timer = QTimer(self)
-        self._topmost_timer.timeout.connect(self._force_topmost)
-        self._topmost_timer.start(50)
         # Slower repaint for live reset countdowns.
         self._tick = QTimer(self)
         self._tick.timeout.connect(self.update)
         self._tick.start(1000)
-        QTimer.singleShot(50, self.reposition)
+        # Embed into the taskbar shortly after creation. Needs winId() to be
+        # valid, which it isn't until show() runs.
+        QTimer.singleShot(100, self._embed_and_position)
+
+    def _embed_and_position(self) -> None:
+        self.show()
+        self._embed_in_taskbar()
+        self.reposition()
 
     def set_data(self, pct5, tr5, pct7, tr7) -> None:
         self._pct5, self._tr5 = pct5, tr5
@@ -849,20 +852,83 @@ class TaskbarWidget(QWidget):
             return
         tb_l, tb_t, tb_r, tb_b, tray_l, tray_t = geo
         tb_h = tb_b - tb_t
-        # Two square icons sized to fit the taskbar height
         icon = max(20, tb_h - 6)
         w = icon * 2 + self._gap
         h = icon
-        # Slot ourselves just left of the tray notification area
-        x = tray_l - w - 6
-        y = tb_t + (tb_h - h) // 2
+        # Detect explorer.exe restart — taskbar HWND changes, we need to re-embed
+        if self._embedded and sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+                u = ctypes.windll.user32
+                u.FindWindowW.restype = wintypes.HWND
+                u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+                current_tb = int(u.FindWindowW("Shell_TrayWnd", None) or 0)
+                if current_tb and current_tb != self._taskbar_hwnd:
+                    self._embedded = False
+            except Exception:
+                pass
+        if not self._embedded:
+            self._embed_in_taskbar()
+        if self._embedded:
+            # Position relative to taskbar's client area
+            x = (tray_l - tb_l) - w - 6
+            y = (tb_h - h) // 2
+        else:
+            # Fallback: absolute screen position + topmost ranking
+            x = tray_l - w - 6
+            y = tb_t + (tb_h - h) // 2
         self._icon_size = icon
         self.resize(w, h)
         self.move(x, y)
-        # Always show — isVisible() can lie when Qt's internal state has
-        # drifted from what the Windows shell actually displays.
         self.show()
-        self._force_topmost()
+        if not self._embedded:
+            self._force_topmost()
+
+    def _embed_in_taskbar(self) -> bool:
+        """Reparent our window into Shell_TrayWnd so the taskbar can never
+        paint over us. Returns True on success.
+
+        Child windows live in the parent's z-context — they're painted after
+        the parent, so the taskbar simply *can't* draw on top of us. This is
+        what CodeZeno does (WS_CHILD + SetParent on the taskbar HWND).
+        """
+        if sys.platform != "win32":
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            u.FindWindowW.restype = wintypes.HWND
+            u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+            u.SetParent.restype = wintypes.HWND
+            u.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+            u.GetWindowLongW.restype = ctypes.c_long
+            u.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+            u.SetWindowLongW.restype = ctypes.c_long
+            u.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+
+            taskbar = int(u.FindWindowW("Shell_TrayWnd", None) or 0)
+            my_hwnd = int(self.winId())
+            if not taskbar or not my_hwnd:
+                return False
+
+            GWL_STYLE = -16
+            WS_POPUP        = 0x80000000
+            WS_CHILD        = 0x40000000
+            WS_VISIBLE      = 0x10000000
+            WS_CLIPSIBLINGS = 0x04000000
+            style = u.GetWindowLongW(my_hwnd, GWL_STYLE)
+            new_style = (style & ~WS_POPUP) | WS_CHILD | WS_CLIPSIBLINGS | WS_VISIBLE
+            u.SetWindowLongW(my_hwnd, GWL_STYLE, new_style)
+            result = u.SetParent(my_hwnd, taskbar)
+            if not result:
+                return False
+            self._embedded = True
+            self._taskbar_hwnd = taskbar
+            return True
+        except Exception:
+            return False
 
     def _force_topmost(self) -> None:
         """Re-rank above the taskbar (Shell_TrayWnd is HWND_TOPMOST too —
