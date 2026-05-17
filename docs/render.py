@@ -140,46 +140,105 @@ def render_tray_strip(pairs: list[tuple[float, float, float, float]],
 
 
 # ---------------------------------------------------------------------------
-# Compose the hero image (widget + tray strip stacked)
+# Mock Windows taskbar — shows the overlay icons in their actual context
+# ---------------------------------------------------------------------------
+
+TASKBAR_BG = QColor(32, 32, 32)
+TASKBAR_TEXT = QColor(220, 220, 225)
+TASKBAR_DIM = QColor(160, 165, 175)
+
+
+def render_taskbar_mockup(pct5: float, tr5: float,
+                          pct7: float, tr7: float,
+                          width: int = 880, height: int = 56) -> QPixmap:
+    """A representative slice of the Windows taskbar with our overlay icons
+    embedded on the left, then fake chevron, fake tray icons, and clock.
+    Icons are drawn at actual taskbar height for visual fidelity."""
+    pix = QPixmap(width, height)
+    pix.fill(QColor(20, 22, 26))
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.setRenderHint(QPainter.TextAntialiasing, True)
+    # Taskbar strip across the full width
+    bar_y = 8
+    bar_h = height - 16
+    p.setPen(Qt.NoPen)
+    p.setBrush(TASKBAR_BG)
+    p.drawRect(0, bar_y, width, bar_h)
+
+    icon = bar_h - 6
+    gap = 4
+    # Our overlay icons — positioned just left of where the "tray" starts
+    tray_x = width - 320
+    overlay_w = icon * 2 + gap
+    overlay_x = tray_x - overlay_w - 12
+    overlay_y = bar_y + 3
+    i5 = make_tray_pixmap(pct5, tr5, icon, marker="h")
+    i7 = make_tray_pixmap(pct7, tr7, icon, marker="d")
+    p.drawPixmap(overlay_x, overlay_y, i5)
+    p.drawPixmap(overlay_x + icon + gap, overlay_y, i7)
+
+    # Fake chevron
+    p.setFont(QFont("Segoe UI", int(icon * 0.5)))
+    p.setPen(TASKBAR_DIM)
+    p.drawText(QRectF(tray_x, bar_y, 24, bar_h), Qt.AlignCenter, "˄")
+
+    # Fake tray icons (just simple shapes so the layout reads)
+    tx = tray_x + 30
+    for col in [QColor(120, 170, 220), QColor(180, 180, 190),
+                QColor(180, 180, 190), QColor(140, 200, 180)]:
+        p.setBrush(col); p.setPen(Qt.NoPen)
+        p.drawRoundedRect(tx, bar_y + bar_h / 2 - 8, 16, 16, 2, 2)
+        tx += 28
+
+    # Fake clock
+    p.setFont(QFont("Segoe UI", 9))
+    p.setPen(TASKBAR_TEXT)
+    p.drawText(QRectF(width - 110, bar_y, 96, bar_h / 2),
+               Qt.AlignVCenter | Qt.AlignRight, "5:33 PM")
+    p.drawText(QRectF(width - 110, bar_y + bar_h / 2, 96, bar_h / 2),
+               Qt.AlignVCenter | Qt.AlignRight, "5/16/2026")
+    p.end()
+    return pix
+
+
+# ---------------------------------------------------------------------------
+# Compose the hero image: taskbar mockup on top + floating widget below
 # ---------------------------------------------------------------------------
 
 def render_hero() -> QPixmap:
-    # 72% used with 80% of window still left → urgency 52 → amber
+    # Two paired scenarios so the hero conveys both surfaces at once
+    taskbar = render_taskbar_mockup(72.0, 80.0, 35.0, 78.0,
+                                    width=940, height=56)
     widget = render_widget(72.0, 35.0, tr5=80, tr7=78,
                            reset5="4h 1m", reset7="5d 12h", scale=2)
-    tray = render_tray_strip(
-        [(5.0,  95.0, 3.0,  98.0),
-         (55.0, 90.0, 30.0, 92.0),
-         (88.0, 65.0, 60.0, 55.0),
-         (95.0, 10.0, 80.0, 22.0)],
-        scale=6, gap=4, group_gap=22,
-    )
 
     pad = 24
-    W = max(widget.width(), tray.width()) + pad * 2
-    H = widget.height() + tray.height() + pad * 3 + 28
+    W = max(taskbar.width(), widget.width()) + pad * 2
+    H = taskbar.height() + widget.height() + pad * 3 + 56
     pix = QPixmap(W, H)
-    pix.fill(QColor(28, 30, 36))
+    pix.fill(QColor(18, 20, 24))
     p = QPainter(pix)
     p.setRenderHint(QPainter.Antialiasing, True)
     p.setRenderHint(QPainter.TextAntialiasing, True)
 
-    title = QFont()
-    title.setBold(True)
-    title.setPointSizeF(11)
-    p.setFont(title)
-    p.setPen(QColor(170, 175, 188))
-    p.drawText(QRectF(pad, pad, W - 2 * pad, 22),
-               Qt.AlignLeft | Qt.AlignVCenter, "floating widget")
+    title = QFont(); title.setBold(True); title.setPointSizeF(11)
+    p.setFont(title); p.setPen(QColor(170, 175, 188))
 
-    p.drawPixmap((W - widget.width()) // 2, pad + 22, widget)
+    # Section A: taskbar overlay
+    y = pad
+    p.drawText(QRectF(pad, y, W - 2*pad, 22), Qt.AlignLeft | Qt.AlignVCenter,
+               "in-taskbar overlay (lives next to your tray)")
+    y += 22
+    p.drawPixmap((W - taskbar.width()) // 2, y, taskbar)
+    y += taskbar.height() + 20
 
-    p.setFont(title)
-    p.drawText(QRectF(pad, pad + 22 + widget.height() + 12, W - 2 * pad, 22),
-               Qt.AlignLeft | Qt.AlignVCenter, "tray icons (shown 6× upscaled)")
+    # Section B: floating widget that pops up on click
+    p.drawText(QRectF(pad, y, W - 2*pad, 22), Qt.AlignLeft | Qt.AlignVCenter,
+               "floating widget (click the overlay to toggle)")
+    y += 22
+    p.drawPixmap((W - widget.width()) // 2, y, widget)
 
-    p.drawPixmap((W - tray.width()) // 2,
-                 pad + 22 + widget.height() + 12 + 22, tray)
     p.end()
     return pix
 
@@ -257,15 +316,19 @@ def main() -> None:
     for name, p5, p7, tr5, tr7, r5, r7 in states:
         render_widget(p5, p7, tr5, tr7, r5, r7, scale=2).save(str(out / name))
 
-    # Individual: tray strip across scenarios
-    # Scenarios that span the urgency color range so the README is illustrative
+    # Overlay-icon strip across the urgency color range
     render_tray_strip(
-        [(5.0,  95.0, 3.0,  98.0),   # all chill — green
-         (55.0, 90.0, 30.0, 92.0),   # mid % + fresh window = burning fast — amber/red
-         (88.0, 65.0, 60.0, 55.0),   # high % + half window left = red zone
-         (95.0, 10.0, 80.0, 22.0)],  # very high % but reset imminent = green
+        [(5.0,  95.0, 3.0,  98.0),
+         (55.0, 90.0, 30.0, 92.0),
+         (88.0, 65.0, 60.0, 55.0),
+         (95.0, 10.0, 80.0, 22.0)],
         scale=8, gap=6, group_gap=28,
     ).save(str(out / "tray.png"))
+
+    # Mock taskbar at three urgency states — actual context users see
+    render_taskbar_mockup( 8.0, 95.0,  4.0, 98.0).save(str(out / "taskbar-low.png"))
+    render_taskbar_mockup(72.0, 80.0, 35.0, 78.0).save(str(out / "taskbar-mid.png"))
+    render_taskbar_mockup(95.0, 65.0, 60.0, 55.0).save(str(out / "taskbar-high.png"))
 
     render_urgency_explainer().save(str(out / "urgency.png"))
 

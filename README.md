@@ -78,21 +78,28 @@ Windows places new tray icons under the overflow chevron `^` by default. Pin the
 
 | Surface | Action | What it does |
 |---|---|---|
-| Tray icon | Left-click | Show / hide the floating widget |
-| Tray icon | Right-click | Show / hide widget • Refresh now • Quit |
-| Tray icon | Hover | Tooltip with exact % and reset countdown |
+| Taskbar overlay | Left-click | Show / hide the floating widget |
+| Taskbar overlay | Right-click | Show / hide widget • Refresh now • Quit |
+| Taskbar overlay | Hover | Tooltip with exact % and reset countdown |
 | Widget | Left-click + drag | Move (position persisted) |
 | Widget | Scroll wheel | Resize (0.6× – 2.0×) |
-| Widget | Right-click | Refresh now • Opacity 50 / 75 / 92 / 100 % • Quit |
+| Widget | Right-click | Hide widget • Refresh now • Opacity 50 / 75 / 92 / 100 % • Quit |
 
-## States at a glance
+## What it looks like
 
-| | Chill | Burning fast | Made it |
-|---|---|---|---|
-| Scenario | low % regardless of time | mid % with lots of window left | high % but reset is right there |
-| Widget | ![chill](docs/widget-low.png) | ![burning](docs/widget-mid.png) | ![made-it](docs/widget-high.png) |
+**In your taskbar** (mock — actual icons sit on top of your real taskbar to the left of the chevron):
 
-Tray icons across four scenarios spanning the urgency range (shown 8× upscaled):
+| Chill | Burning fast | At-the-limit |
+|---|---|---|
+| ![low](docs/taskbar-low.png) | ![mid](docs/taskbar-mid.png) | ![high](docs/taskbar-high.png) |
+
+**Floating widget** (pops up when you click the overlay):
+
+| Chill | Burning fast | Made it |
+|---|---|---|
+| ![chill](docs/widget-low.png) | ![burning](docs/widget-mid.png) | ![made-it](docs/widget-high.png) |
+
+Overlay icons across four urgency scenarios (shown 8× upscaled):
 
 ![tray](docs/tray.png)
 
@@ -127,11 +134,18 @@ This minimizes the OAuth refresh race — whichever side calls refresh first inv
 
 ## Why a taskbar overlay instead of tray icons
 
-`QSystemTrayIcon` is the standard Qt API for "thing in the tray" but it's hard-capped at 16×16 pixels per slot (`SM_CXSMICON`). That's barely enough room for two stacked characters. The clock, ink workspace, and "real" CodeZeno-style widgets aren't tray icons — they're regular Win32 windows positioned over the taskbar.
+`QSystemTrayIcon` is the standard Qt API for "thing in the tray" but it's hard-capped at 16×16 pixels per slot (`SM_CXSMICON`). That's barely enough room for two stacked characters. The clock, ink workspace, and "real" CodeZeno-style widgets aren't tray icons — they're regular Win32 windows attached *to* the taskbar.
 
-We do the same: `FindWindow("Shell_TrayWnd")` to get the taskbar HWND, `FindWindowEx(..., "TrayNotifyWnd")` for the tray notification area, then create a frameless transparent always-on-top window and position it just left of the tray, sized to the full taskbar height (~32 px). We re-poll the taskbar geometry every ~1.5 s so the overlay follows the taskbar across autohide, DPI changes, and monitor disconnects.
+We do the same:
 
-Result: each icon is ~30 px tall instead of 16, so the percentage number is readable without squinting.
+1. `FindWindow("Shell_TrayWnd")` to get the taskbar HWND.
+2. `FindWindowEx(..., "TrayNotifyWnd")` to find the tray notification area, so we know where to position ourselves.
+3. Create a frameless Qt window, then modify its style to `WS_CHILD` and call `SetParent(our_hwnd, taskbar_hwnd)`. This makes our window a **child of the taskbar's window hierarchy** — child windows are rendered in the parent's z-context, *after* the parent's own content. So the taskbar literally cannot paint over us. No amount of clicking on the speaker icon, the chevron, or empty taskbar space can bury us.
+4. Re-poll the taskbar geometry every ~1 s to follow autohide / DPI changes / monitor disconnects. Detect `Shell_TrayWnd` HWND changing (explorer.exe restart) and re-embed if needed.
+
+Result: each icon is ~32 px tall instead of 16, the percentage number is readable, and the overlay can't be obscured by taskbar interaction.
+
+**Why we initially tried other approaches and failed:** standard `QSystemTrayIcon` capped us at 16×16. Switching to a floating top-most window worked visually but Shell_TrayWnd has special z-order treatment that beat plain `HWND_TOPMOST` — clicking the taskbar would let the shell repaint over us. Even 20 Hz polling of `SetWindowPos(HWND_TOPMOST)` couldn't keep up. The `SetParent`+`WS_CHILD` approach is the actual solution and is what CodeZeno's Rust implementation uses.
 
 ## Configuration
 
@@ -152,7 +166,7 @@ State (window position, size, opacity, visibility) lives in `~/.claude/.usagedas
 python docs/render.py
 ```
 
-Produces `hero.png`, `tray.png`, `widget-low/mid/high.png`, and `urgency.png` from synthetic data — no live desktop screenshots are ever captured, so the repo never leaks personal taskbar / wallpaper content.
+Produces `hero.png`, `taskbar-low/mid/high.png`, `tray.png`, `widget-low/mid/high.png`, `urgency.png`, and `urgency_curve.png` — all from synthetic data, so the repo never leaks personal taskbar / wallpaper content.
 
 ## Uninstall
 
