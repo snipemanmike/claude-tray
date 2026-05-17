@@ -821,21 +821,22 @@ class TaskbarWidget(QWidget):
         self._gap = 4
 
         # Re-position over the taskbar — handles taskbar autohide / DPI /
-        # monitor changes. Cheap so we can poll fast.
+        # monitor changes. Heavier (FindWindow + GetWindowRect), so slower cadence.
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.reposition)
-        self._timer.start(500)
-        # Repaint + re-assert topmost every second so any z-order disruption
-        # (e.g. clicking the overlay activates something else and demotes us
-        # in the topmost band) self-heals quickly.
+        self._timer.start(1000)
+        # Hot poll: re-assert HWND_TOPMOST very fast so clicking ANYWHERE on
+        # the taskbar (which activates Shell_TrayWnd and demotes us) can't
+        # bury us for more than ~50ms. SetWindowPos with NOSIZE+NOMOVE is
+        # near-free (~5-10 microseconds), so 20 Hz is negligible CPU.
+        self._topmost_timer = QTimer(self)
+        self._topmost_timer.timeout.connect(self._force_topmost)
+        self._topmost_timer.start(50)
+        # Slower repaint for live reset countdowns.
         self._tick = QTimer(self)
-        self._tick.timeout.connect(self._tick_update)
+        self._tick.timeout.connect(self.update)
         self._tick.start(1000)
         QTimer.singleShot(50, self.reposition)
-
-    def _tick_update(self) -> None:
-        self.update()
-        self._force_topmost()
 
     def set_data(self, pct5, tr5, pct7, tr7) -> None:
         self._pct5, self._tr5 = pct5, tr5
