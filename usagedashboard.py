@@ -838,10 +838,15 @@ class TaskbarWidget(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.reposition)
         self._timer.start(1000)
-        # Slower repaint for live reset countdowns.
+        # Slower repaint for live reset countdowns. Both Qt.update() and
+        # the Win32 force-redraw — see _force_redraw for why.
         self._tick = QTimer(self)
-        self._tick.timeout.connect(self.update)
+        self._tick.timeout.connect(self._tick_repaint)
         self._tick.start(1000)
+
+    def _tick_repaint(self) -> None:
+        self.update()
+        self._force_redraw()
         # Embed into the taskbar shortly after creation. Needs winId() to be
         # valid, which it isn't until show() runs.
         QTimer.singleShot(100, self._embed_and_position)
@@ -855,6 +860,25 @@ class TaskbarWidget(QWidget):
         self._pct5, self._tr5 = pct5, tr5
         self._pct7, self._tr7 = pct7, tr7
         self.update()
+        self._force_redraw()
+
+    def _force_redraw(self) -> None:
+        """After SetParent into Shell_TrayWnd, Qt's QWidget.update() doesn't
+        always result in a WM_PAINT — the parent owns invalidation. Force
+        it via Win32 so the displayed pixels actually match self._pct5/etc.
+        """
+        if sys.platform != "win32" or not self._embedded:
+            return
+        try:
+            import ctypes
+            RDW_INVALIDATE = 0x0001
+            RDW_UPDATENOW  = 0x0100
+            ctypes.windll.user32.RedrawWindow(
+                int(self.winId()), None, None,
+                RDW_INVALIDATE | RDW_UPDATENOW,
+            )
+        except Exception:
+            pass
 
     def reposition(self) -> None:
         geo = _taskbar_geometry()
