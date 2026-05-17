@@ -300,40 +300,9 @@ def render_urgency_explainer() -> QPixmap:
 def main() -> None:
     app = QApplication.instance() or QApplication(sys.argv)
     out = Path(__file__).resolve().parent
-
-    # Hero / README banner
     render_hero().save(str(out / "hero.png"))
-
-    # Three states that span the urgency color range
-    states = [
-        # chill: low % regardless of time → green
-        ("widget-low.png",  8.0,  4.0,  85, 95, "4h 12m", "5d 8h"),
-        # burning fast: mid % but window mostly fresh → amber/red
-        ("widget-mid.png",  65.0, 38.0, 85, 90, "4h 15m", "6d 8h"),
-        # the made-it state: high % but reset is right there → green
-        ("widget-high.png", 96.0, 78.0, 8,  18, "12m",    "1d 5h"),
-    ]
-    for name, p5, p7, tr5, tr7, r5, r7 in states:
-        render_widget(p5, p7, tr5, tr7, r5, r7, scale=2).save(str(out / name))
-
-    # Overlay-icon strip across the urgency color range
-    render_tray_strip(
-        [(5.0,  95.0, 3.0,  98.0),
-         (55.0, 90.0, 30.0, 92.0),
-         (88.0, 65.0, 60.0, 55.0),
-         (95.0, 10.0, 80.0, 22.0)],
-        scale=8, gap=6, group_gap=28,
-    ).save(str(out / "tray.png"))
-
-    # Mock taskbar at three urgency states — actual context users see
-    render_taskbar_mockup( 8.0, 95.0,  4.0, 98.0).save(str(out / "taskbar-low.png"))
-    render_taskbar_mockup(72.0, 80.0, 35.0, 78.0).save(str(out / "taskbar-mid.png"))
-    render_taskbar_mockup(95.0, 65.0, 60.0, 55.0).save(str(out / "taskbar-high.png"))
-
-    render_urgency_explainer().save(str(out / "urgency.png"))
-
     for f in sorted(out.glob("*.png")):
-        print(f"{f.name:18s}  {f.stat().st_size:>6} bytes")
+        print(f"{f.name:24s}  {f.stat().st_size:>6} bytes")
 
 
 if __name__ == "__main__":
