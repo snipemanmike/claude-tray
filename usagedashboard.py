@@ -419,6 +419,7 @@ class Widget(QWidget):
         self._backoff_steps: int = 0
         self._oauth_skip_until: float = 0.0
         self._last_method: str = ""
+        self._consecutive_429: int = 0
         self.tray_5h: QSystemTrayIcon | None = None
         self.tray_7d: QSystemTrayIcon | None = None
         self.taskbar: TaskbarWidget | None = None
@@ -467,7 +468,7 @@ class Widget(QWidget):
         p.end()
 
     # --- polling -----------------------------------------------------------
-    def refresh_now(self) -> None:
+    def refresh_now(self, manual: bool = False) -> None:
         if not self.token:
             self.token = read_token()
         if not self.token:
@@ -475,10 +476,21 @@ class Widget(QWidget):
             self.update()
             return
 
+        # User-initiated refresh: clear any OAuth backoff so we really do
+        # try both endpoints fresh. Important when the window just reset
+        # and the user wants to see new values immediately.
+        if manual:
+            self._backoff_steps = 0
+            self._oauth_skip_until = 0.0
+            self._consecutive_429 = 0
+
         data, status = self._fetch(allow_refresh=True)
         if data is None:
             self._handle_fetch_error(status)
             return
+
+        # Successful fetch — clear the rate-limit streak counter
+        self._consecutive_429 = 0
 
         # Always keep the timer at the normal cadence on success
         self._timer.start(POLL_SECONDS * 1000)
@@ -570,7 +582,7 @@ class Widget(QWidget):
     def _show_menu(self, global_pos: QPoint) -> None:
         m = QMenu(self)
         m.addAction("Hide widget", self.toggle_visible)
-        m.addAction("Refresh now", self.refresh_now)
+        m.addAction("Refresh now", lambda: self.refresh_now(manual=True))
         m.addSeparator()
         for label, val in [("Opacity 50%", 0.5), ("Opacity 75%", 0.75),
                            ("Opacity 92%", 0.92), ("Opacity 100%", 1.0)]:
@@ -639,17 +651,42 @@ class Widget(QWidget):
         return data, status
 
     def _handle_fetch_error(self, status: int | None) -> None:
-        """Both primary + fallback failed. Stay on normal cadence; show why."""
+        """Both primary + fallback failed. Stay on normal cadence; show why.
+        If we keep getting 429 from both endpoints AND a recent successful
+        poll showed we were already running hot, infer we've hit the limit
+        and force the display to 100% — the rate-limit IS the signal."""
         if status == 429:
+            self._consecutive_429 += 1
             self.last_error = "rate-limited (both endpoints) — retrying"
+            if self._consecutive_429 >= 2:
+                self._infer_at_limit()
         elif status in (401, 403):
             self.last_error = "auth failed — open Claude Code to refresh"
         elif status is not None:
             self.last_error = f"HTTP {status}"
         else:
             self.last_error = "network error"
-        # Keep gauges showing the last good reading.
+        # Keep gauges showing the last good reading (or the inferred 100%).
         self.update()
+
+    def _infer_at_limit(self) -> None:
+        """If the last good poll showed >= 85 % on a limit, two consecutive
+        rate-limit errors almost certainly mean we hit that limit. Bump the
+        display to 100 % so the user sees the actual state."""
+        pct5 = self.gauge_5h.pct
+        pct7 = self.gauge_7d.pct
+        changed = False
+        if pct5 is not None and pct5 >= 85.0 and pct5 < 100.0:
+            self.gauge_5h.pct = 100.0
+            changed = True
+        if pct7 is not None and pct7 >= 85.0 and pct7 < 100.0:
+            self.gauge_7d.pct = 100.0
+            changed = True
+        if changed and self.taskbar is not None:
+            self.taskbar.set_data(
+                self.gauge_5h.pct, self.gauge_5h.time_rem_pct,
+                self.gauge_7d.pct, self.gauge_7d.time_rem_pct,
+            )
 
     def toggle_visible(self) -> None:
         self._visible_pref = not self.isVisible()
@@ -1016,7 +1053,7 @@ class TaskbarWidget(QWidget):
         m = QMenu()
         m.addAction("Show / hide widget", self._on_click)
         m.addAction("Refresh now",
-                    lambda: QApplication.instance()._refresh_now())
+                    lambda: QApplication.instance()._refresh_now(manual=True))
         m.addSeparator()
         m.addAction("Quit", QApplication.instance().quit)
         m.exec(gp)
