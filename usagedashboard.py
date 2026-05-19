@@ -429,12 +429,23 @@ class Widget(QWidget):
         self._timer.timeout.connect(self.refresh_now)
         self._timer.start(POLL_SECONDS * 1000)
 
-        # Repaint countdown labels once per second without re-polling
+        # Repaint countdown labels once per second without re-polling. Also
+        # re-push current gauge data into the taskbar overlay every tick so
+        # the two surfaces can't drift out of sync after a lock/unlock or any
+        # other event that disrupted a set_data call.
         self._tick = QTimer(self)
-        self._tick.timeout.connect(self.update)
+        self._tick.timeout.connect(self._tick_repaint)
         self._tick.start(1000)
 
         QTimer.singleShot(50, self.refresh_now)
+
+    def _tick_repaint(self) -> None:
+        self.update()
+        if self.taskbar is not None:
+            self.taskbar.set_data(
+                self.gauge_5h.pct, self.gauge_5h.time_rem_pct,
+                self.gauge_7d.pct, self.gauge_7d.time_rem_pct,
+            )
 
     # --- painting ----------------------------------------------------------
     def paintEvent(self, _e: QPaintEvent) -> None:
@@ -926,7 +937,8 @@ class TaskbarWidget(QWidget):
         icon = max(20, tb_h - 6)
         w = icon * 2 + self._gap
         h = icon
-        # Detect explorer.exe restart — taskbar HWND changes, we need to re-embed
+        # Detect explorer.exe restart OR a session change that severed our
+        # SetParent relationship — either way we need to re-embed.
         if self._embedded and sys.platform == "win32":
             try:
                 import ctypes
@@ -934,8 +946,13 @@ class TaskbarWidget(QWidget):
                 u = ctypes.windll.user32
                 u.FindWindowW.restype = wintypes.HWND
                 u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+                u.GetParent.restype = wintypes.HWND
+                u.GetParent.argtypes = [wintypes.HWND]
                 current_tb = int(u.FindWindowW("Shell_TrayWnd", None) or 0)
-                if current_tb and current_tb != self._taskbar_hwnd:
+                our_parent = int(u.GetParent(int(self.winId())) or 0)
+                if (not current_tb
+                        or current_tb != self._taskbar_hwnd
+                        or our_parent != current_tb):
                     self._embedded = False
             except Exception:
                 pass
