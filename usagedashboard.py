@@ -2,8 +2,8 @@
 Always-on Claude Code usage dashboard.
 
 Two surfaces, same visual language:
-  - Two tray icons (5h session, 7d weekly) with the % in the centre
-    coloured by an urgency model (pct + time_remaining% − 100) and a
+  - Three tray icons (5h session, 7d weekly, 7d Fable) with the % in the
+    centre coloured by an urgency model (pct + time_remaining% − 100) and a
     white perimeter ring that drains as the reset window elapses.
   - Frameless transparent always-on-top widget mirroring the same ring
     behaviour at a larger size, with reset countdowns and labels.
@@ -20,13 +20,22 @@ from __future__ import annotations
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from PySide6.QtCore import QPoint, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QAbstractNativeEventFilter,
+    QPoint,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -310,6 +319,29 @@ def fmt_reset(iso: str | None) -> str:
         return "—"
 
 
+def _fable_limit(data: dict) -> dict | None:
+    """Extract the Fable weekly-scoped cap from a usage payload.
+
+    The OAuth endpoint reports per-model weekly limits as entries in the
+    `limits` array (kind 'weekly_scoped'), tagged by scope.model.display_name.
+    The top-level seven_day_* keys are all null for these, so this array is the
+    only reliable source. Returns the raw limit dict (carries 'percent' and
+    'resets_at') or None when Fable is absent — e.g. the header-probe fallback,
+    whose data has no `limits` array at all.
+    """
+    limits = data.get("limits")
+    if not isinstance(limits, list):
+        return None
+    for item in limits:
+        if not isinstance(item, dict):
+            continue
+        scope = item.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        if isinstance(model, dict) and model.get("display_name") == "Fable":
+            return item
+    return None
+
+
 class RingGauge:
     """Pure paint helper — no widget, just draws into a QPainter."""
 
@@ -318,12 +350,14 @@ class RingGauge:
         self.pct: float | None = None
         self.time_rem_pct: float | None = None
         self.reset_label = "—"
+        self.reset_iso: str | None = None   # kept so the reading can be cached
 
     def update(self, pct: float | None, reset_iso: str | None,
                time_rem_pct: float | None) -> None:
         self.pct = pct
         self.time_rem_pct = time_rem_pct
         self.reset_label = fmt_reset(reset_iso)
+        self.reset_iso = reset_iso
 
     def paint(self, p: QPainter, rect: QRectF) -> None:
         # Ring drains with TIME REMAINING (matches the tray-icon behavior).
@@ -390,18 +424,34 @@ class Widget(QWidget):
         # Don't steal focus when shown — otherwise the taskbar overlay gets
         # demoted in the topmost band and the Windows taskbar paints over it.
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        self.setMinimumSize(QSize(220, 130))
+        # Min width holds each of the three gauges at ~100px — the same
+        # per-gauge size the two-gauge layout used at its default width.
+        self.setMinimumSize(QSize(300, 130))
 
         self.gauge_5h = RingGauge("5h session")
         self.gauge_7d = RingGauge("7d weekly")
+        self.gauge_fable = RingGauge("7d Fable")
         self.last_error: str | None = None
         self.last_fetch_ts: float = 0.0
         self.token = read_token()
 
         state = load_state()
+
+        # Seed Fable from its last cached reading. Its only source is the
+        # aggressively-throttled OAuth metadata endpoint (the header-probe
+        # fallback can't see it), so without this a restart during a throttle
+        # window shows blank. Weekly usage barely moves, so a recent cached
+        # value is accurate; skip it only if its window has already elapsed.
+        cached_fpct = state.get("fable_pct")
+        cached_freset = state.get("fable_resets_at")
+        if cached_fpct is not None and cached_freset:
+            trf = time_remaining_pct(cached_freset, 7 * 86400)
+            if trf:  # non-zero/non-None => window still open
+                self.gauge_fable.update(cached_fpct, cached_freset, trf)
+
         x = state.get("x")
         y = state.get("y")
-        self.resize(state.get("w", 260), state.get("h", 150))
+        self.resize(state.get("w", 340), state.get("h", 150))
         self._opacity = state.get("opacity", 0.92)
         self.setWindowOpacity(self._opacity)
         if x is not None and y is not None and self._point_on_some_screen(x, y):
@@ -422,6 +472,7 @@ class Widget(QWidget):
         self._consecutive_429: int = 0
         self.tray_5h: QSystemTrayIcon | None = None
         self.tray_7d: QSystemTrayIcon | None = None
+        self.tray_fable: QSystemTrayIcon | None = None
         self.taskbar: TaskbarWidget | None = None
         self.setWindowTitle("Claude usage")
 
@@ -445,6 +496,7 @@ class Widget(QWidget):
             self.taskbar.set_data(
                 self.gauge_5h.pct, self.gauge_5h.time_rem_pct,
                 self.gauge_7d.pct, self.gauge_7d.time_rem_pct,
+                self.gauge_fable.pct, self.gauge_fable.time_rem_pct,
             )
 
     # --- painting ----------------------------------------------------------
@@ -458,14 +510,14 @@ class Widget(QWidget):
         p.setBrush(QBrush(BG_COLOR))
         p.drawRoundedRect(bg, 14, 14)
 
-        # Layout: two gauges side by side, with label area above
+        # Layout: three gauges side by side, with label area above
         inner = bg.adjusted(10, 22, -10, -10)
-        half_w = inner.width() / 2
-        left = QRectF(inner.left(), inner.top(), half_w - 4, inner.height())
-        right = QRectF(inner.left() + half_w + 4, inner.top(),
-                       half_w - 4, inner.height())
-        self.gauge_5h.paint(p, left)
-        self.gauge_7d.paint(p, right)
+        gauges = (self.gauge_5h, self.gauge_7d, self.gauge_fable)
+        gap = 6
+        col_w = (inner.width() - gap * (len(gauges) - 1)) / len(gauges)
+        for i, gauge in enumerate(gauges):
+            x = inner.left() + i * (col_w + gap)
+            gauge.paint(p, QRectF(x, inner.top(), col_w, inner.height()))
 
         if self.last_error:
             err_font = QFont()
@@ -520,17 +572,35 @@ class Widget(QWidget):
         self.gauge_5h.update(pct5, five.get("resets_at"), tr5)
         self.gauge_7d.update(pct7, seven.get("resets_at"), tr7)
 
+        # Fable's weekly-scoped cap lives in the `limits` array, not a
+        # top-level key, and is absent from header-probe data — leave the last
+        # reading in place when this poll didn't carry it.
+        fable = _fable_limit(data)
+        if fable is not None:
+            fable_reset = fable.get("resets_at")
+            self.gauge_fable.update(
+                fable.get("percent"), fable_reset,
+                time_remaining_pct(fable_reset, 7 * 86400),
+            )
+            # Cache it so it survives OAuth throttle windows and restarts.
+            self._persist()
+        pctf = self.gauge_fable.pct
+        trf = self.gauge_fable.time_rem_pct
+        resetf = self.gauge_fable.reset_label
+
         tooltip = self._tooltip(data)
         self.setToolTip(tooltip)
         reset5 = fmt_reset(five.get("resets_at"))
         reset7 = fmt_reset(seven.get("resets_at"))
         if self.taskbar is not None:
-            self.taskbar.set_data(pct5, tr5, pct7, tr7)
+            self.taskbar.set_data(pct5, tr5, pct7, tr7, pctf, trf)
             tip = []
             if pct5 is not None:
                 tip.append(f"5-hour session: {pct5:.0f}% — resets in {reset5}")
             if pct7 is not None:
                 tip.append(f"7-day weekly: {pct7:.0f}% — resets in {reset7}")
+            if pctf is not None:
+                tip.append(f"7-day Fable: {pctf:.0f}% — resets in {resetf}")
             self.taskbar.setToolTip("\n".join(tip) or "loading…")
         if self.tray_5h is not None:
             self.tray_5h.setIcon(make_tray_icon(pct5, tr5, marker="h"))
@@ -544,6 +614,12 @@ class Widget(QWidget):
                 f"7-day weekly: {pct7:.0f}% — resets in {reset7}"
                 if pct7 is not None else "7-day weekly: —"
             )
+        if self.tray_fable is not None:
+            self.tray_fable.setIcon(make_tray_icon(pctf, trf, marker="fd"))
+            self.tray_fable.setToolTip(
+                f"7-day Fable: {pctf:.0f}% — resets in {resetf}"
+                if pctf is not None else "7-day Fable: —"
+            )
         self.update()
 
     def _tooltip(self, data: dict) -> str:
@@ -554,6 +630,10 @@ class Widget(QWidget):
             if isinstance(block, dict) and block.get("utilization") is not None:
                 lines.append(f"{key}: {block['utilization']:.1f}%  "
                              f"resets {fmt_reset(block.get('resets_at'))}")
+        fable = _fable_limit(data)
+        if fable is not None and fable.get("percent") is not None:
+            lines.append(f"fable (7d): {fable['percent']}%  "
+                         f"resets {fmt_reset(fable.get('resets_at'))}")
         extra = data.get("extra_usage")
         if isinstance(extra, dict) and extra.get("is_enabled"):
             lines.append(f"extra: {extra.get('utilization')}% of "
@@ -686,6 +766,7 @@ class Widget(QWidget):
         display to 100 % so the user sees the actual state."""
         pct5 = self.gauge_5h.pct
         pct7 = self.gauge_7d.pct
+        pctf = self.gauge_fable.pct
         changed = False
         if pct5 is not None and pct5 >= 85.0 and pct5 < 100.0:
             self.gauge_5h.pct = 100.0
@@ -693,10 +774,14 @@ class Widget(QWidget):
         if pct7 is not None and pct7 >= 85.0 and pct7 < 100.0:
             self.gauge_7d.pct = 100.0
             changed = True
+        if pctf is not None and pctf >= 85.0 and pctf < 100.0:
+            self.gauge_fable.pct = 100.0
+            changed = True
         if changed and self.taskbar is not None:
             self.taskbar.set_data(
                 self.gauge_5h.pct, self.gauge_5h.time_rem_pct,
                 self.gauge_7d.pct, self.gauge_7d.time_rem_pct,
+                self.gauge_fable.pct, self.gauge_fable.time_rem_pct,
             )
 
     def toggle_visible(self) -> None:
@@ -711,12 +796,20 @@ class Widget(QWidget):
         return QGuiApplication.screenAt(QPoint(x + 20, y + 20)) is not None
 
     def _persist(self) -> None:
-        save_state({
+        state = load_state()
+        state.update({
             "x": self.x(), "y": self.y(),
             "w": self.width(), "h": self.height(),
             "opacity": self._opacity,
             "visible": self._visible_pref,
         })
+        # Only overwrite the cached Fable reading when we actually hold one —
+        # a drag/toggle persist while the gauge is still blank (OAuth
+        # throttled since launch) must not wipe the cache on disk.
+        if self.gauge_fable.pct is not None:
+            state["fable_pct"] = self.gauge_fable.pct
+            state["fable_resets_at"] = self.gauge_fable.reset_iso
+        save_state(state)
 
 
 def make_tray_pixmap(pct: float | None, time_rem_pct: float | None,
@@ -775,13 +868,17 @@ def make_tray_pixmap(pct: float | None, time_rem_pct: float | None,
     p.setPen(fill)
     p.drawText(rect, Qt.AlignCenter, text)
 
-    # Tiny identity letter in the bottom-right corner (e.g. 'h' for 5h, 'd' for 7d)
+    # Tiny identity marker in the bottom-right corner (e.g. 'h' for 5h, 'd'
+    # for 7d, 'fd' for Fable weekly). Two-char markers get a smaller font and
+    # a wider box so they fit the corner without clipping or hitting the number.
     if marker:
         mf = QFont()
         mf.setBold(True)
-        mf.setPointSizeF(size * 0.30)
+        mf.setPointSizeF(size * (0.30 if len(marker) == 1 else 0.24))
         p.setFont(mf)
-        marker_rect = QRectF(size * 0.55, size * 0.55, size * 0.45, size * 0.45)
+        corner = 0.55 if len(marker) == 1 else 0.42
+        marker_rect = QRectF(size * corner, size * 0.55,
+                             size * (1.0 - corner), size * 0.45)
         p.setPen(QColor(0, 0, 0, 200))
         for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             p.drawText(marker_rect.translated(dx, dy), Qt.AlignCenter, marker)
@@ -875,10 +972,13 @@ class TaskbarWidget(QWidget):
         self._tr5: float | None = None
         self._pct7: float | None = None
         self._tr7: float | None = None
+        self._pctf: float | None = None
+        self._trf: float | None = None
         self._icon_size = 28
         self._gap = 4
         self._embedded = False        # True once SetParent into Shell_TrayWnd succeeded
         self._taskbar_hwnd: int = 0   # cached parent HWND so we can detect explorer restarts
+        self._recovery_requested_at: float = 0.0
 
         # Re-position over the taskbar — handles autohide / DPI / monitor /
         # explorer-restart. Once we're a child of Shell_TrayWnd we can't be
@@ -891,26 +991,27 @@ class TaskbarWidget(QWidget):
         self._tick = QTimer(self)
         self._tick.timeout.connect(self._tick_repaint)
         self._tick.start(1000)
-
-    def _tick_repaint(self) -> None:
-        self.update()
-        self._force_redraw()
         # Embed into the taskbar shortly after creation. Needs winId() to be
         # valid, which it isn't until show() runs.
         QTimer.singleShot(100, self._embed_and_position)
+
+    def _tick_repaint(self) -> None:
+        self.repaint()
+        self._force_redraw()
 
     def _embed_and_position(self) -> None:
         self.show()
         self._embed_in_taskbar()
         self.reposition()
 
-    def set_data(self, pct5, tr5, pct7, tr7) -> None:
+    def set_data(self, pct5, tr5, pct7, tr7, pctf=None, trf=None) -> None:
         self._pct5, self._tr5 = pct5, tr5
         self._pct7, self._tr7 = pct7, tr7
-        self.update()
+        self._pctf, self._trf = pctf, trf
+        self.repaint()
         self._force_redraw()
 
-    def _force_redraw(self) -> None:
+    def _force_redraw(self, include_parent: bool = False) -> None:
         """After SetParent into Shell_TrayWnd, Qt's QWidget.update() doesn't
         always result in a WM_PAINT — the parent owns invalidation. Force
         it via Win32 so the displayed pixels actually match self._pct5/etc.
@@ -919,14 +1020,48 @@ class TaskbarWidget(QWidget):
             return
         try:
             import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            u.GetParent.restype = wintypes.HWND
+            u.GetParent.argtypes = [wintypes.HWND]
+            u.RedrawWindow.restype = wintypes.BOOL
+            u.RedrawWindow.argtypes = [
+                wintypes.HWND, ctypes.c_void_p, wintypes.HRGN, wintypes.UINT
+            ]
             RDW_INVALIDATE = 0x0001
             RDW_UPDATENOW  = 0x0100
-            ctypes.windll.user32.RedrawWindow(
-                int(self.winId()), None, None,
-                RDW_INVALIDATE | RDW_UPDATENOW,
+            RDW_ALLCHILDREN = 0x0080
+            hwnd = int(self.winId())
+            u.RedrawWindow(
+                hwnd, None, None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
             )
+            if include_parent:
+                parent = int(u.GetParent(hwnd) or 0)
+                if parent:
+                    u.RedrawWindow(
+                        parent, None, None,
+                        RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+                    )
         except Exception:
             pass
+
+    def recover_shell_surface(self, reason: str = "") -> None:
+        """Refresh the HWND/taskbar relationship after lock, sleep, or explorer reset."""
+        if sys.platform != "win32":
+            return
+        now = time.monotonic()
+        if now - self._recovery_requested_at < 0.75:
+            return
+        self._recovery_requested_at = now
+        for delay in (0, 250, 1000, 3000):
+            QTimer.singleShot(delay, self._recover_shell_surface_now)
+
+    def _recover_shell_surface_now(self) -> None:
+        self._detach_from_taskbar()
+        self._embed_and_position()
+        self.repaint()
+        self._force_redraw(include_parent=True)
 
     def reposition(self) -> None:
         geo = _taskbar_geometry()
@@ -935,7 +1070,7 @@ class TaskbarWidget(QWidget):
         tb_l, tb_t, tb_r, tb_b, tray_l, tray_t = geo
         tb_h = tb_b - tb_t
         icon = max(20, tb_h - 6)
-        w = icon * 2 + self._gap
+        w = icon * 3 + self._gap * 2
         h = icon
         # Detect explorer.exe restart OR a session change that severed our
         # SetParent relationship — either way we need to re-embed.
@@ -973,6 +1108,53 @@ class TaskbarWidget(QWidget):
         if not self._embedded:
             self._force_topmost()
 
+    def _detach_from_taskbar(self) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            u.SetParent.restype = wintypes.HWND
+            u.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+            u.GetWindowLongW.restype = ctypes.c_long
+            u.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+            u.SetWindowLongW.restype = ctypes.c_long
+            u.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+            u.SetWindowPos.restype = wintypes.BOOL
+            u.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                wintypes.UINT,
+            ]
+
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+
+            GWL_STYLE = -16
+            WS_POPUP = 0x80000000
+            WS_CHILD = 0x40000000
+            style = u.GetWindowLongW(hwnd, GWL_STYLE)
+            u.SetWindowLongW(hwnd, GWL_STYLE, (style & ~WS_CHILD) | WS_POPUP)
+            u.SetParent(hwnd, 0)
+
+            HWND_TOPMOST = -1
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+            SWP_HIDEWINDOW = 0x0080
+            u.SetWindowPos(
+                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE |
+                SWP_FRAMECHANGED | SWP_HIDEWINDOW,
+            )
+        except Exception:
+            pass
+        self._embedded = False
+        self._taskbar_hwnd = 0
+
     def _embed_in_taskbar(self) -> bool:
         """Reparent our window into Shell_TrayWnd so the taskbar can never
         paint over us. Returns True on success.
@@ -995,6 +1177,12 @@ class TaskbarWidget(QWidget):
             u.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
             u.SetWindowLongW.restype = ctypes.c_long
             u.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+            u.SetWindowPos.restype = wintypes.BOOL
+            u.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                wintypes.UINT,
+            ]
 
             taskbar = int(u.FindWindowW("Shell_TrayWnd", None) or 0)
             my_hwnd = int(self.winId())
@@ -1009,9 +1197,23 @@ class TaskbarWidget(QWidget):
             style = u.GetWindowLongW(my_hwnd, GWL_STYLE)
             new_style = (style & ~WS_POPUP) | WS_CHILD | WS_CLIPSIBLINGS | WS_VISIBLE
             u.SetWindowLongW(my_hwnd, GWL_STYLE, new_style)
+            ctypes.windll.kernel32.SetLastError(0)
             result = u.SetParent(my_hwnd, taskbar)
-            if not result:
+            # SetParent returns the previous parent. For a top-level window,
+            # previous parent is NULL even when the call succeeds.
+            if not result and ctypes.windll.kernel32.GetLastError():
                 return False
+            HWND_TOP = 0
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+            SWP_SHOWWINDOW = 0x0040
+            u.SetWindowPos(
+                my_hwnd, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE |
+                SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+            )
             self._embedded = True
             self._taskbar_hwnd = taskbar
             return True
@@ -1025,12 +1227,20 @@ class TaskbarWidget(QWidget):
             return
         try:
             import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            u.SetWindowPos.restype = wintypes.BOOL
+            u.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                wintypes.UINT,
+            ]
             HWND_TOPMOST = -1
             SWP_NOSIZE = 0x0001
             SWP_NOMOVE = 0x0002
             SWP_NOACTIVATE = 0x0010
             SWP_SHOWWINDOW = 0x0040
-            ctypes.windll.user32.SetWindowPos(
+            u.SetWindowPos(
                 int(self.winId()), HWND_TOPMOST,
                 0, 0, 0, 0,
                 SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
@@ -1044,10 +1254,13 @@ class TaskbarWidget(QWidget):
         p.setRenderHint(QPainter.TextAntialiasing, True)
         p.setRenderHint(QPainter.SmoothPixmapTransform, True)
         s = self._icon_size
+        step = s + self._gap
         i5 = make_tray_pixmap(self._pct5, self._tr5, s, marker="h")
         i7 = make_tray_pixmap(self._pct7, self._tr7, s, marker="d")
+        ifb = make_tray_pixmap(self._pctf, self._trf, s, marker="fd")
         p.drawPixmap(0, 0, i5)
-        p.drawPixmap(s + self._gap, 0, i7)
+        p.drawPixmap(step, 0, i7)
+        p.drawPixmap(2 * step, 0, ifb)
         p.end()
 
     def mousePressEvent(self, e) -> None:
@@ -1076,6 +1289,107 @@ class TaskbarWidget(QWidget):
         m.exec(gp)
 
 
+class WindowsShellEventFilter(QAbstractNativeEventFilter):
+    """Watch shell/session messages that can stale a SetParent taskbar child."""
+
+    WM_POWERBROADCAST = 0x0218
+    WM_WTSSESSION_CHANGE = 0x02B1
+    PBT_APMRESUMECRITICAL = 0x0006
+    PBT_APMRESUMESUSPEND = 0x0007
+    PBT_APMRESUMEAUTOMATIC = 0x0012
+    WTS_CONSOLE_CONNECT = 0x1
+    WTS_REMOTE_CONNECT = 0x3
+    WTS_SESSION_LOGON = 0x5
+    WTS_SESSION_UNLOCK = 0x8
+
+    def __init__(self, taskbar: TaskbarWidget, widget: Widget) -> None:
+        super().__init__()
+        self._taskbar = taskbar
+        self._widget = widget
+        self._registered_hwnd = 0
+        self._last_refresh_request_at = 0.0
+        self._taskbar_created_msg = 0
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                self._taskbar_created_msg = int(
+                    ctypes.windll.user32.RegisterWindowMessageW("TaskbarCreated")
+                    or 0
+                )
+            except Exception:
+                self._taskbar_created_msg = 0
+
+    def register_session_notifications(self, hwnd: int) -> None:
+        if sys.platform != "win32" or not hwnd:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            wts = ctypes.windll.wtsapi32
+            wts.WTSRegisterSessionNotification.argtypes = [
+                wintypes.HWND, wintypes.DWORD
+            ]
+            wts.WTSRegisterSessionNotification.restype = wintypes.BOOL
+            if wts.WTSRegisterSessionNotification(hwnd, 0):
+                self._registered_hwnd = hwnd
+        except Exception:
+            self._registered_hwnd = 0
+
+    def unregister_session_notifications(self) -> None:
+        if sys.platform != "win32" or not self._registered_hwnd:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            wts = ctypes.windll.wtsapi32
+            wts.WTSUnRegisterSessionNotification.argtypes = [wintypes.HWND]
+            wts.WTSUnRegisterSessionNotification.restype = wintypes.BOOL
+            wts.WTSUnRegisterSessionNotification(self._registered_hwnd)
+        except Exception:
+            pass
+        self._registered_hwnd = 0
+
+    def nativeEventFilter(self, event_type, message):
+        if sys.platform != "win32":
+            return False, 0
+        try:
+            from ctypes import wintypes
+            ptr = int(message)
+            msg = wintypes.MSG.from_address(ptr)
+            msg_id = int(msg.message)
+            wparam = int(msg.wParam)
+        except Exception:
+            return False, 0
+
+        if self._taskbar_created_msg and msg_id == self._taskbar_created_msg:
+            self._recover("taskbar-created")
+        elif msg_id == self.WM_POWERBROADCAST and wparam in (
+            self.PBT_APMRESUMECRITICAL,
+            self.PBT_APMRESUMESUSPEND,
+            self.PBT_APMRESUMEAUTOMATIC,
+        ):
+            self._recover("power-resume")
+        elif msg_id == self.WM_WTSSESSION_CHANGE and wparam in (
+            self.WTS_CONSOLE_CONNECT,
+            self.WTS_REMOTE_CONNECT,
+            self.WTS_SESSION_LOGON,
+            self.WTS_SESSION_UNLOCK,
+        ):
+            self._recover("session-change")
+        return False, 0
+
+    def _recover(self, reason: str) -> None:
+        self._taskbar.recover_shell_surface(reason)
+        QTimer.singleShot(0, self._widget._tick_repaint)
+        QTimer.singleShot(750, self._widget._tick_repaint)
+
+        now = time.monotonic()
+        if now - self._last_refresh_request_at < 10:
+            return
+        self._last_refresh_request_at = now
+        QTimer.singleShot(2000, lambda: self._widget.refresh_now(manual=True))
+
+
 def _wire_tray(tray: QSystemTrayIcon, widget: "Widget", app: QApplication) -> None:
     menu = QMenu()
     show_hide = QAction("Show / hide widget", menu)
@@ -1094,15 +1408,77 @@ def _wire_tray(tray: QSystemTrayIcon, widget: "Widget", app: QApplication) -> No
 
 def make_tray_icons(
     app: QApplication, widget: "Widget"
-) -> tuple[QSystemTrayIcon, QSystemTrayIcon]:
-    """Two side-by-side tray icons: 5h session on the left, 7d weekly on the right."""
+) -> tuple[QSystemTrayIcon, QSystemTrayIcon, QSystemTrayIcon]:
+    """Three side-by-side tray icons: 5h session, 7d weekly, 7d Fable."""
     tray_5h = QSystemTrayIcon(make_tray_icon(None, None, marker="h"), app)
     tray_7d = QSystemTrayIcon(make_tray_icon(None, None, marker="d"), app)
+    tray_fable = QSystemTrayIcon(make_tray_icon(None, None, marker="fd"), app)
     tray_5h.setToolTip("Claude Code — 5-hour session (loading…)")
     tray_7d.setToolTip("Claude Code — 7-day weekly (loading…)")
+    tray_fable.setToolTip("Claude Code — 7-day Fable (loading…)")
     _wire_tray(tray_5h, widget, app)
     _wire_tray(tray_7d, widget, app)
-    return tray_5h, tray_7d
+    _wire_tray(tray_fable, widget, app)
+    return tray_5h, tray_7d, tray_fable
+
+
+def _kill_other_instances() -> None:
+    """Terminate any other process already running this script.
+
+    Launching the dashboard means 'replace whatever is running with this
+    code'. Stale instances are worse than useless: an old build keeps
+    rewriting the state file in its own format (clobbering newer fields)
+    and fights the new instance for the taskbar embed slot.
+    """
+    if sys.platform != "win32":
+        return
+    me = os.getpid()
+    try:
+        out = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-Command",
+                "Get-CimInstance Win32_Process -Filter "
+                "\"Name like 'python%'\" | "
+                "Select-Object ProcessId,CommandLine,"
+                "@{n='Created';e={$_.CreationDate.ToFileTimeUtc()}} | "
+                "ConvertTo-Json",
+            ],
+            capture_output=True, text=True, timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        procs = json.loads(out.stdout or "[]")
+        if isinstance(procs, dict):   # ConvertTo-Json unwraps single results
+            procs = [procs]
+    except Exception:
+        return
+    mine = next(
+        (pr for pr in procs
+         if isinstance(pr, dict) and pr.get("ProcessId") == me), None)
+    my_created = (mine or {}).get("Created") or 0
+    import ctypes
+    PROCESS_TERMINATE = 0x0001
+    k = ctypes.windll.kernel32
+    for pr in procs:
+        try:
+            pid = int(pr.get("ProcessId") or 0)
+            cmd = (pr.get("CommandLine") or "").lower()
+            created = int(pr.get("Created") or 0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if not pid or pid == me or "usagedashboard.py" not in cmd:
+            continue
+        # Newest launch wins: never kill an instance started after us, so
+        # two near-simultaneous launches can't terminate each other. (The
+        # newer one will sweep us instead. PID breaks exact-tick ties.)
+        if created > my_created or (created == my_created and pid > me):
+            continue
+        try:
+            h = k.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if h:
+                k.TerminateProcess(h, 0)
+                k.CloseHandle(h)
+        except Exception:
+            pass
 
 
 def _set_aumid() -> None:
@@ -1119,6 +1495,7 @@ def _set_aumid() -> None:
 
 
 def main() -> int:
+    _kill_other_instances()
     _set_aumid()
     app = QApplication(sys.argv)
     app.setApplicationName("Claude Usage Dashboard")
@@ -1132,11 +1509,16 @@ def main() -> int:
     app._taskbar = taskbar  # keep alive  # type: ignore[attr-defined]
     # Expose refresh on the QApplication so the taskbar right-click menu can hit it
     app._refresh_now = w.refresh_now  # type: ignore[attr-defined]
+    shell_events = WindowsShellEventFilter(taskbar, w)
+    app.installNativeEventFilter(shell_events)
+    shell_events.register_session_notifications(int(w.winId()))
+    app._shell_events = shell_events  # keep alive  # type: ignore[attr-defined]
 
     if w._visible_pref:
         w.show()
 
     def _cleanup() -> None:
+        shell_events.unregister_session_notifications()
         taskbar.hide()
     app.aboutToQuit.connect(_cleanup)
 
