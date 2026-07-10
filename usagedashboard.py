@@ -2,9 +2,12 @@
 Always-on Claude Code usage dashboard.
 
 Two surfaces, same visual language:
-  - Three tray icons (5h session, 7d weekly, 7d Fable) with the % in the
-    centre coloured by an urgency model (pct + time_remaining% − 100) and a
-    white perimeter ring that drains as the reset window elapses.
+  - Five taskbar tiles — Claude (5h session, 7d weekly, 7d Fable) and
+    OpenAI/ChatGPT (5h, weekly, read from local Codex CLI session logs) —
+    with the % in the centre coloured by an urgency model
+    (pct + time_remaining% − 100) and a white perimeter ring that drains
+    as the reset window elapses. Providers are demarcated by tile base
+    colour (slate vs teal), marker letters, and a wider gap.
   - Frameless transparent always-on-top widget mirroring the same ring
     behaviour at a larger size, with reset countdowns and labels.
 
@@ -81,6 +84,13 @@ BLUE  = QColor( 95, 175, 240)   # under-utilizing — plenty of headroom
 GREEN = QColor(110, 200, 140)   # on pace — maximizing compute-to-cost
 AMBER = QColor(235, 175,  60)   # burning faster than reset can save you
 RED   = QColor(235,  80,  80)   # will exhaust before the window resets
+
+# Provider demarcation: gauges [:GROUP_SPLIT] are Claude, the rest OpenAI.
+# OpenAI tiles get a teal-dark base (vs Claude's neutral slate) and both
+# surfaces put a wider gap / divider line between the two groups.
+GROUP_SPLIT = 3
+CLAUDE_TILE_BASE = QColor(40, 44, 52)
+OPENAI_TILE_BASE = QColor(22, 48, 42)
 
 
 # Urgency-to-colour gradient anchors. The diagonals on the (time_rem, pct)
@@ -297,6 +307,53 @@ def fetch_usage_via_headers(token: str) -> tuple[dict | None, int | None]:
         return None, None
 
 
+CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+
+
+def fetch_openai_usage() -> dict | None:
+    """Newest ChatGPT plan rate-limit snapshot from Codex CLI session logs.
+
+    Codex CLI embeds a `rate_limits` block in the token_count events it
+    appends to ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl:
+
+        {"primary":   {"used_percent": 8.0, "window_minutes": 300,
+                       "resets_at": <epoch s>},          # 5h window
+         "secondary":  {... "window_minutes": 10080 ...}, # weekly
+         "plan_type": "prolite"}
+
+    These are the same plan-level meters ChatGPT Settings -> Usage shows.
+    Reading the tail of recent files is free, offline and unthrottleable;
+    the trade-off is freshness — the snapshot is only as recent as the
+    last Codex activity (ChatGPT app usage between Codex runs is unseen).
+    """
+    try:
+        files = sorted(
+            CODEX_SESSIONS_DIR.glob("*/*/*/rollout-*.jsonl"),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )[:8]
+    except OSError:
+        return None
+    for f in files:
+        try:
+            with open(f, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - 262144))
+                tail = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        for line in reversed(tail.splitlines()):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                rl = json.loads(line)["payload"]["rate_limits"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            if isinstance(rl, dict) and isinstance(rl.get("primary"), dict):
+                return rl
+    return None
+
+
 def fmt_reset(iso: str | None) -> str:
     if not iso:
         return "—"
@@ -424,13 +481,20 @@ class Widget(QWidget):
         # Don't steal focus when shown — otherwise the taskbar overlay gets
         # demoted in the topmost band and the Windows taskbar paints over it.
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        # Min width holds each of the three gauges at ~100px — the same
-        # per-gauge size the two-gauge layout used at its default width.
-        self.setMinimumSize(QSize(300, 130))
+        # Min width holds each of the five gauges at ~90px.
+        self.setMinimumSize(QSize(470, 130))
 
         self.gauge_5h = RingGauge("5h session")
         self.gauge_7d = RingGauge("7d weekly")
         self.gauge_fable = RingGauge("7d Fable")
+        self.gauge_gpt5h = RingGauge("5h GPT")
+        self.gauge_gptw = RingGauge("7d GPT")
+        # Paint/taskbar order with per-tile marker; [:GROUP_SPLIT] = Claude.
+        self._all_gauges: list[tuple[RingGauge, str]] = [
+            (self.gauge_5h, "h"), (self.gauge_7d, "d"),
+            (self.gauge_fable, "fd"),
+            (self.gauge_gpt5h, "g"), (self.gauge_gptw, "gw"),
+        ]
         self.last_error: str | None = None
         self.last_fetch_ts: float = 0.0
         self.token = read_token()
@@ -451,7 +515,7 @@ class Widget(QWidget):
 
         x = state.get("x")
         y = state.get("y")
-        self.resize(state.get("w", 340), state.get("h", 150))
+        self.resize(state.get("w", 520), state.get("h", 150))
         self._opacity = state.get("opacity", 0.92)
         self.setWindowOpacity(self._opacity)
         if x is not None and y is not None and self._point_on_some_screen(x, y):
@@ -490,14 +554,13 @@ class Widget(QWidget):
 
         QTimer.singleShot(50, self.refresh_now)
 
+    def _taskbar_entries(self) -> list[tuple[float | None, float | None, str]]:
+        return [(g.pct, g.time_rem_pct, m) for g, m in self._all_gauges]
+
     def _tick_repaint(self) -> None:
         self.update()
         if self.taskbar is not None:
-            self.taskbar.set_data(
-                self.gauge_5h.pct, self.gauge_5h.time_rem_pct,
-                self.gauge_7d.pct, self.gauge_7d.time_rem_pct,
-                self.gauge_fable.pct, self.gauge_fable.time_rem_pct,
-            )
+            self.taskbar.set_data(self._taskbar_entries())
 
     # --- painting ----------------------------------------------------------
     def paintEvent(self, _e: QPaintEvent) -> None:
@@ -510,14 +573,23 @@ class Widget(QWidget):
         p.setBrush(QBrush(BG_COLOR))
         p.drawRoundedRect(bg, 14, 14)
 
-        # Layout: three gauges side by side, with label area above
+        # Layout: five gauges side by side (Claude trio | OpenAI pair) with
+        # label area above and a divider line between the provider groups.
         inner = bg.adjusted(10, 22, -10, -10)
-        gauges = (self.gauge_5h, self.gauge_7d, self.gauge_fable)
-        gap = 6
-        col_w = (inner.width() - gap * (len(gauges) - 1)) / len(gauges)
+        gauges = [g for g, _ in self._all_gauges]
+        gap, group_gap = 6, 14
+        n = len(gauges)
+        col_w = (inner.width() - gap * (n - 1) - group_gap) / n
+        x = inner.left()
         for i, gauge in enumerate(gauges):
-            x = inner.left() + i * (col_w + gap)
+            if i == GROUP_SPLIT:
+                div_x = x + group_gap / 2 - gap / 2
+                p.setPen(QPen(TRACK_COLOR, 1))
+                p.drawLine(int(div_x), int(inner.top() - 8),
+                           int(div_x), int(inner.bottom()))
+                x += group_gap
             gauge.paint(p, QRectF(x, inner.top(), col_w, inner.height()))
+            x += col_w + gap
 
         if self.last_error:
             err_font = QFont()
@@ -531,7 +603,39 @@ class Widget(QWidget):
         p.end()
 
     # --- polling -----------------------------------------------------------
+    def _update_openai(self) -> None:
+        """Refresh the two GPT gauges from the local Codex session logs.
+
+        Free and offline, so it runs every poll regardless of how the
+        Anthropic endpoints are doing.
+        """
+        rl = fetch_openai_usage()
+        if not rl:
+            return
+        now = time.time()
+        for gauge, block in ((self.gauge_gpt5h, rl.get("primary")),
+                             (self.gauge_gptw, rl.get("secondary"))):
+            if not isinstance(block, dict):
+                continue
+            resets_epoch = block.get("resets_at")
+            window_s = (block.get("window_minutes") or 0) * 60
+            if resets_epoch and resets_epoch < now:
+                # The snapshot predates a window reset and Codex hasn't run
+                # since, so nothing has been used in the current window.
+                # (ChatGPT-app usage in the meantime is invisible to us.)
+                gauge.update(0.0, None, None)
+                continue
+            iso = None
+            if resets_epoch:
+                iso = datetime.fromtimestamp(
+                    resets_epoch, timezone.utc).isoformat()
+            gauge.update(
+                block.get("used_percent"), iso,
+                time_remaining_pct(iso, window_s) if window_s else None,
+            )
+
     def refresh_now(self, manual: bool = False) -> None:
+        self._update_openai()
         if not self.token:
             self.token = read_token()
         if not self.token:
@@ -593,7 +697,7 @@ class Widget(QWidget):
         reset5 = fmt_reset(five.get("resets_at"))
         reset7 = fmt_reset(seven.get("resets_at"))
         if self.taskbar is not None:
-            self.taskbar.set_data(pct5, tr5, pct7, tr7, pctf, trf)
+            self.taskbar.set_data(self._taskbar_entries())
             tip = []
             if pct5 is not None:
                 tip.append(f"5-hour session: {pct5:.0f}% — resets in {reset5}")
@@ -601,6 +705,11 @@ class Widget(QWidget):
                 tip.append(f"7-day weekly: {pct7:.0f}% — resets in {reset7}")
             if pctf is not None:
                 tip.append(f"7-day Fable: {pctf:.0f}% — resets in {resetf}")
+            for gauge, name in ((self.gauge_gpt5h, "GPT 5-hour"),
+                                (self.gauge_gptw, "GPT weekly")):
+                if gauge.pct is not None:
+                    tip.append(f"{name}: {gauge.pct:.0f}% — resets in "
+                               f"{gauge.reset_label}")
             self.taskbar.setToolTip("\n".join(tip) or "loading…")
         if self.tray_5h is not None:
             self.tray_5h.setIcon(make_tray_icon(pct5, tr5, marker="h"))
@@ -634,6 +743,11 @@ class Widget(QWidget):
         if fable is not None and fable.get("percent") is not None:
             lines.append(f"fable (7d): {fable['percent']}%  "
                          f"resets {fmt_reset(fable.get('resets_at'))}")
+        for gauge, name in ((self.gauge_gpt5h, "gpt (5h)"),
+                            (self.gauge_gptw, "gpt (7d)")):
+            if gauge.pct is not None:
+                lines.append(f"{name}: {gauge.pct:.1f}%  "
+                             f"resets {gauge.reset_label}")
         extra = data.get("extra_usage")
         if isinstance(extra, dict) and extra.get("is_enabled"):
             lines.append(f"extra: {extra.get('utilization')}% of "
@@ -778,11 +892,7 @@ class Widget(QWidget):
             self.gauge_fable.pct = 100.0
             changed = True
         if changed and self.taskbar is not None:
-            self.taskbar.set_data(
-                self.gauge_5h.pct, self.gauge_5h.time_rem_pct,
-                self.gauge_7d.pct, self.gauge_7d.time_rem_pct,
-                self.gauge_fable.pct, self.gauge_fable.time_rem_pct,
-            )
+            self.taskbar.set_data(self._taskbar_entries())
 
     def toggle_visible(self) -> None:
         self._visible_pref = not self.isVisible()
@@ -813,16 +923,18 @@ class Widget(QWidget):
 
 
 def make_tray_pixmap(pct: float | None, time_rem_pct: float | None,
-                     size: int = 16, marker: str | None = None) -> QPixmap:
+                     size: int = 16, marker: str | None = None,
+                     base: QColor | None = None) -> QPixmap:
     """Render a tray icon natively at the requested size.
 
     Design:
-      - dark rounded base
+      - dark rounded base (`base` tints it per provider — slate for Claude,
+        teal for OpenAI)
       - white perimeter arc shows `time_rem_pct` of the reset window remaining
         (100 = just reset → full circle; 0 = imminent reset → empty)
       - severity-coloured bold percentage in the center
-      - optional `marker` letter in the bottom corner so the 5h and 7d
-        icons stay distinguishable even when Windows shuffles their order
+      - optional `marker` letter in the bottom corner so the icons stay
+        distinguishable even when Windows shuffles their order
     """
     pix = QPixmap(size, size)
     pix.fill(Qt.transparent)
@@ -834,7 +946,7 @@ def make_tray_pixmap(pct: float | None, time_rem_pct: float | None,
 
     # Dark base
     p.setPen(Qt.NoPen)
-    p.setBrush(QColor(40, 44, 52))
+    p.setBrush(base or CLAUDE_TILE_BASE)
     p.drawRoundedRect(0, 0, size, size, radius, radius)
 
     # Time-remaining arc (white)
@@ -968,14 +1080,13 @@ class TaskbarWidget(QWidget):
         self.setWindowTitle("Claude usage (taskbar)")
 
         self._on_click = on_click
-        self._pct5: float | None = None
-        self._tr5: float | None = None
-        self._pct7: float | None = None
-        self._tr7: float | None = None
-        self._pctf: float | None = None
-        self._trf: float | None = None
+        # (pct, time_rem_pct, marker) per tile; [:GROUP_SPLIT] = Claude
+        self._entries: list[tuple[float | None, float | None, str]] = [
+            (None, None, m) for m in ("h", "d", "fd", "g", "gw")
+        ]
         self._icon_size = 28
         self._gap = 4
+        self._group_gap = 10   # extra space between the provider groups
         self._embedded = False        # True once SetParent into Shell_TrayWnd succeeded
         self._taskbar_hwnd: int = 0   # cached parent HWND so we can detect explorer restarts
         self._recovery_requested_at: float = 0.0
@@ -1004,12 +1115,16 @@ class TaskbarWidget(QWidget):
         self._embed_in_taskbar()
         self.reposition()
 
-    def set_data(self, pct5, tr5, pct7, tr7, pctf=None, trf=None) -> None:
-        self._pct5, self._tr5 = pct5, tr5
-        self._pct7, self._tr7 = pct7, tr7
-        self._pctf, self._trf = pctf, trf
+    def set_data(
+        self, entries: list[tuple[float | None, float | None, str]]
+    ) -> None:
+        self._entries = list(entries)
         self.repaint()
         self._force_redraw()
+
+    def _row_width(self, icon: int) -> int:
+        n = len(self._entries)
+        return icon * n + self._gap * (n - 1) + self._group_gap
 
     def _force_redraw(self, include_parent: bool = False) -> None:
         """After SetParent into Shell_TrayWnd, Qt's QWidget.update() doesn't
@@ -1070,7 +1185,7 @@ class TaskbarWidget(QWidget):
         tb_l, tb_t, tb_r, tb_b, tray_l, tray_t = geo
         tb_h = tb_b - tb_t
         icon = max(20, tb_h - 6)
-        w = icon * 3 + self._gap * 2
+        w = self._row_width(icon)
         h = icon
         # Detect explorer.exe restart OR a session change that severed our
         # SetParent relationship — either way we need to re-embed.
@@ -1093,13 +1208,22 @@ class TaskbarWidget(QWidget):
                 pass
         if not self._embedded:
             self._embed_in_taskbar()
+        # Right edge anchored just left of the tray, then dodge any small
+        # topmost pill floating over that spot (e.g. dictation bubbles) —
+        # they'd otherwise paint over our leftmost tiles.
+        sx = tray_l - w - 6
+        for _ in range(3):
+            block = self._find_obstruction(sx, tb_t, sx + w, tb_b)
+            if block is None or block - w - 4 < tb_l:
+                break
+            sx = block - w - 4
         if self._embedded:
             # Position relative to taskbar's client area
-            x = (tray_l - tb_l) - w - 6
+            x = sx - tb_l
             y = (tb_h - h) // 2
         else:
             # Fallback: absolute screen position + topmost ranking
-            x = tray_l - w - 6
+            x = sx
             y = tb_t + (tb_h - h) // 2
         self._icon_size = icon
         self.resize(w, h)
@@ -1107,6 +1231,53 @@ class TaskbarWidget(QWidget):
         self.show()
         if not self._embedded:
             self._force_topmost()
+
+    def _find_obstruction(self, left: int, top: int,
+                          right: int, bottom: int) -> int | None:
+        """Left edge of a small always-on-top window overlapping the given
+        screen rect, or None. Catches utility pills that dock over the
+        taskbar near the tray (dictation bubbles, recorders, …) — as
+        topmost siblings they'd paint over our embedded row, so we slide
+        left of them instead. Filters to small (≤600×200) topmost windows
+        from other processes so ordinary app windows never trigger a dodge.
+        """
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            GWL_EXSTYLE = -20
+            WS_EX_TOPMOST = 0x0008
+            my_pid = os.getpid()
+            hits: list[int] = []
+
+            @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def _cb(hwnd, _lp):
+                if not u.IsWindowVisible(hwnd):
+                    return True
+                pid = wintypes.DWORD()
+                u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value == my_pid:
+                    return True
+                if not (u.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST):
+                    return True
+                r = wintypes.RECT()
+                if not u.GetWindowRect(hwnd, ctypes.byref(r)):
+                    return True
+                w_, h_ = r.right - r.left, r.bottom - r.top
+                if not (0 < w_ <= 600 and 0 < h_ <= 200):
+                    return True
+                if (r.right <= left or r.left >= right
+                        or r.bottom <= top or r.top >= bottom):
+                    return True
+                hits.append(r.left)
+                return True
+
+            u.EnumWindows(_cb, 0)
+            return min(hits) if hits else None
+        except Exception:
+            return None
 
     def _detach_from_taskbar(self) -> None:
         if sys.platform != "win32":
@@ -1254,13 +1425,13 @@ class TaskbarWidget(QWidget):
         p.setRenderHint(QPainter.TextAntialiasing, True)
         p.setRenderHint(QPainter.SmoothPixmapTransform, True)
         s = self._icon_size
-        step = s + self._gap
-        i5 = make_tray_pixmap(self._pct5, self._tr5, s, marker="h")
-        i7 = make_tray_pixmap(self._pct7, self._tr7, s, marker="d")
-        ifb = make_tray_pixmap(self._pctf, self._trf, s, marker="fd")
-        p.drawPixmap(0, 0, i5)
-        p.drawPixmap(step, 0, i7)
-        p.drawPixmap(2 * step, 0, ifb)
+        x = 0
+        for i, (pct, tr, marker) in enumerate(self._entries):
+            if i == GROUP_SPLIT:
+                x += self._group_gap
+            base = OPENAI_TILE_BASE if i >= GROUP_SPLIT else CLAUDE_TILE_BASE
+            p.drawPixmap(x, 0, make_tray_pixmap(pct, tr, s, marker, base))
+            x += s + self._gap
         p.end()
 
     def mousePressEvent(self, e) -> None:

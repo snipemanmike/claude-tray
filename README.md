@@ -1,8 +1,8 @@
 # claude-tray
 
-Always-on Claude Code usage dashboard for Windows.
+Always-on Claude Code + ChatGPT usage dashboard for Windows.
 
-Three icons embedded in the Windows taskbar show your 5-hour session (`h`), 7-day weekly (`d`), and 7-day Fable (`fd`) utilization. Click them to pop up a bigger floating widget with rings + reset countdowns.
+Five icons embedded in the Windows taskbar: Claude's 5-hour session (`h`), 7-day weekly (`d`), and 7-day Fable (`fd`) on slate tiles, then ChatGPT's 5-hour (`g`) and weekly (`gw`) limits on teal tiles, with a wider gap between the providers. Click them to pop up a bigger floating widget with rings + reset countdowns and a divider line between the groups.
 
 ![hero](docs/hero.png)
 
@@ -34,7 +34,8 @@ If you want to maximize what you paid for, aim for green.
 - On 429 (the endpoint rate-limits aggressively — see [anthropics/claude-code#31637](https://github.com/anthropics/claude-code/issues/31637)), falls back to a `max_tokens=1` Haiku ping and reads the rate-limit headers (~0.0002 % of 5 h quota per call).
 - The Fable weekly cap only exists in the OAuth endpoint's `limits` array (the header-probe fallback can't see it), so its last reading is cached in the state file and survives throttle windows and restarts.
 - Auto-refreshes its own OAuth token when expired so cold-boot works without launching Claude Code first.
-- Taskbar overlay is a `WS_CHILD` window `SetParent`'d into `Shell_TrayWnd` so the shell can't paint over it.
+- ChatGPT limits come from the Codex CLI's local session logs (`~/.codex/sessions/**/rollout-*.jsonl`), which embed the plan-level `rate_limits` block (primary = 5 h, secondary = weekly) in every token-count event — free, offline, unthrottleable. Freshness equals your last Codex activity; ChatGPT-app usage between Codex runs is invisible until the next run.
+- Taskbar overlay is a `WS_CHILD` window `SetParent`'d into `Shell_TrayWnd` so the shell can't paint over it. It also slides left of any small topmost pill (dictation bubbles etc.) that docks over its spot near the tray.
 - Single-instance: launching the script kills any older instance of itself first, so re-running `run.bat` always means "restart with current code" — no stacked ghosts fighting over the taskbar and state file.
 
 ## Install
