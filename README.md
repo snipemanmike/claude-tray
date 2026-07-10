@@ -2,7 +2,7 @@
 
 Always-on Claude Code + ChatGPT usage dashboard for Windows.
 
-Five icons embedded in the Windows taskbar: Claude's 5-hour session (`h`), 7-day weekly (`d`), and 7-day Fable (`fd`) on slate tiles, then ChatGPT's 5-hour (`g`) and weekly (`gw`) limits on teal tiles, with a wider gap between the providers. Click them to pop up a bigger floating widget with rings + reset countdowns and a divider line between the groups.
+Five icons embedded in the Windows taskbar: ChatGPT's 5-hour (`g`) and weekly (`gw`) limits on teal tiles, then Claude's 5-hour session (`h`), 7-day weekly (`d`), and 7-day Fable (`fd`) on slate tiles, with a wider gap between the providers. Click them to pop up a bigger floating widget with rings + reset countdowns and a divider line between the groups.
 
 ![hero](docs/hero.png)
 

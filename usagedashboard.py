@@ -2,8 +2,8 @@
 Always-on Claude Code usage dashboard.
 
 Two surfaces, same visual language:
-  - Five taskbar tiles — Claude (5h session, 7d weekly, 7d Fable) and
-    OpenAI/ChatGPT (5h, weekly, read from local Codex CLI session logs) —
+  - Five taskbar tiles — OpenAI/ChatGPT (5h, weekly, read from local
+    Codex CLI session logs) then Claude (5h session, 7d weekly, 7d Fable) —
     with the % in the centre coloured by an urgency model
     (pct + time_remaining% − 100) and a white perimeter ring that drains
     as the reset window elapses. Providers are demarcated by tile base
@@ -85,10 +85,10 @@ GREEN = QColor(110, 200, 140)   # on pace — maximizing compute-to-cost
 AMBER = QColor(235, 175,  60)   # burning faster than reset can save you
 RED   = QColor(235,  80,  80)   # will exhaust before the window resets
 
-# Provider demarcation: gauges [:GROUP_SPLIT] are Claude, the rest OpenAI.
+# Provider demarcation: gauges [:GROUP_SPLIT] are OpenAI, the rest Claude.
 # OpenAI tiles get a teal-dark base (vs Claude's neutral slate) and both
 # surfaces put a wider gap / divider line between the two groups.
-GROUP_SPLIT = 3
+GROUP_SPLIT = 2
 CLAUDE_TILE_BASE = QColor(40, 44, 52)
 OPENAI_TILE_BASE = QColor(22, 48, 42)
 
@@ -489,11 +489,11 @@ class Widget(QWidget):
         self.gauge_fable = RingGauge("7d Fable")
         self.gauge_gpt5h = RingGauge("5h GPT")
         self.gauge_gptw = RingGauge("7d GPT")
-        # Paint/taskbar order with per-tile marker; [:GROUP_SPLIT] = Claude.
+        # Paint/taskbar order with per-tile marker; [:GROUP_SPLIT] = OpenAI.
         self._all_gauges: list[tuple[RingGauge, str]] = [
+            (self.gauge_gpt5h, "g"), (self.gauge_gptw, "gw"),
             (self.gauge_5h, "h"), (self.gauge_7d, "d"),
             (self.gauge_fable, "fd"),
-            (self.gauge_gpt5h, "g"), (self.gauge_gptw, "gw"),
         ]
         self.last_error: str | None = None
         self.last_fetch_ts: float = 0.0
@@ -573,7 +573,7 @@ class Widget(QWidget):
         p.setBrush(QBrush(BG_COLOR))
         p.drawRoundedRect(bg, 14, 14)
 
-        # Layout: five gauges side by side (Claude trio | OpenAI pair) with
+        # Layout: five gauges side by side (OpenAI pair | Claude trio) with
         # label area above and a divider line between the provider groups.
         inner = bg.adjusted(10, 22, -10, -10)
         gauges = [g for g, _ in self._all_gauges]
@@ -1080,9 +1080,9 @@ class TaskbarWidget(QWidget):
         self.setWindowTitle("Claude usage (taskbar)")
 
         self._on_click = on_click
-        # (pct, time_rem_pct, marker) per tile; [:GROUP_SPLIT] = Claude
+        # (pct, time_rem_pct, marker) per tile; [:GROUP_SPLIT] = OpenAI
         self._entries: list[tuple[float | None, float | None, str]] = [
-            (None, None, m) for m in ("h", "d", "fd", "g", "gw")
+            (None, None, m) for m in ("g", "gw", "h", "d", "fd")
         ]
         self._icon_size = 28
         self._gap = 4
@@ -1429,7 +1429,7 @@ class TaskbarWidget(QWidget):
         for i, (pct, tr, marker) in enumerate(self._entries):
             if i == GROUP_SPLIT:
                 x += self._group_gap
-            base = OPENAI_TILE_BASE if i >= GROUP_SPLIT else CLAUDE_TILE_BASE
+            base = OPENAI_TILE_BASE if i < GROUP_SPLIT else CLAUDE_TILE_BASE
             p.drawPixmap(x, 0, make_tray_pixmap(pct, tr, s, marker, base))
             x += s + self._gap
         p.end()
