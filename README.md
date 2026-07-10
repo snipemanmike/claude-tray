@@ -1,10 +1,30 @@
 # claude-tray
 
-Always-on Claude Code + ChatGPT usage dashboard for Windows.
+**Every AI usage limit you pay for, always on screen.**
 
-Five icons embedded in the Windows taskbar: ChatGPT's 5-hour (`g`) and weekly (`gw`) limits on teal tiles, then Claude's 5-hour session (`h`), 7-day weekly (`d`), and 7-day Fable (`fd`) on slate tiles, with a wider gap between the providers. Click them to pop up a bigger floating widget with rings + reset countdowns and a divider line between the groups.
+Five live meters embedded in the Windows taskbar — ChatGPT's 5-hour and weekly limits on teal tiles, Claude's 5-hour session, 7-day weekly, and 7-day Fable limits on slate — each one a ring that drains with time and a percentage colored by whether you're *actually* going to run out.
+
+![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
+![python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
+![ui](https://img.shields.io/badge/UI-PySide6-41CD52?logo=qt&logoColor=white)
 
 ![hero](docs/hero.png)
+
+A day of usage, timelapsed — session windows fill and reset, weekly meters creep, colors follow urgency, the white ring is time left in the window:
+
+![timelapse](docs/timelapse.gif)
+
+## Reading the tiles
+
+| tile | meter | source |
+|---|---|---|
+| `g` | ChatGPT 5-hour limit | Codex CLI session logs (local) |
+| `gw` | ChatGPT weekly limit | Codex CLI session logs (local) |
+| `h` | Claude 5-hour session | Anthropic OAuth usage endpoint |
+| `d` | Claude 7-day weekly (all models) | Anthropic OAuth usage endpoint |
+| `fd` | Claude 7-day Fable | OAuth endpoint `limits[]` array |
+
+Teal base = OpenAI, slate base = Claude, wider gap between the groups. Click any tile to toggle the floating widget; right-click for refresh/quit. Drag the widget anywhere, scroll to resize.
 
 ## The color model
 
@@ -25,18 +45,19 @@ Continuous gradient between anchors. Live curve over the full `(time_remaining, 
 
 ![urgency curve](docs/urgency_curve.png)
 
-If you want to maximize what you paid for, aim for green.
+92% used with two hours left is an emergency; 92% used two minutes before reset is a victory lap. If you want to maximize what you paid for, aim for green.
 
 ## How it works
 
-- Reads OAuth token from `~/.claude/.credentials.json` (where Claude Code stores it).
-- Polls `https://api.anthropic.com/api/oauth/usage` every 60 s — free, no quota cost.
-- On 429 (the endpoint rate-limits aggressively — see [anthropics/claude-code#31637](https://github.com/anthropics/claude-code/issues/31637)), falls back to a `max_tokens=1` Haiku ping and reads the rate-limit headers (~0.0002 % of 5 h quota per call).
-- The Fable weekly cap only exists in the OAuth endpoint's `limits` array (the header-probe fallback can't see it), so its last reading is cached in the state file and survives throttle windows and restarts.
-- Auto-refreshes its own OAuth token when expired so cold-boot works without launching Claude Code first.
-- ChatGPT limits come from the Codex CLI's local session logs (`~/.codex/sessions/**/rollout-*.jsonl`), which embed the plan-level `rate_limits` block (primary = 5 h, secondary = weekly) in every token-count event — free, offline, unthrottleable. Freshness equals your last Codex activity; ChatGPT-app usage between Codex runs is invisible until the next run.
-- Taskbar overlay is a `WS_CHILD` window `SetParent`'d into `Shell_TrayWnd` so the shell can't paint over it. It also slides left of any small topmost pill (dictation bubbles etc.) that docks over its spot near the tray.
-- Single-instance: launching the script kills any older instance of itself first, so re-running `run.bat` always means "restart with current code" — no stacked ghosts fighting over the taskbar and state file.
+**Claude** — reads the OAuth token from `~/.claude/.credentials.json` (where Claude Code stores it) and polls `https://api.anthropic.com/api/oauth/usage` every 60 s (free, no quota cost). On 429 — the endpoint rate-limits aggressively ([anthropics/claude-code#31637](https://github.com/anthropics/claude-code/issues/31637)) — it falls back to a `max_tokens=1` Haiku ping and reads the rate-limit headers (~0.0002 % of 5 h quota per call). Auto-refreshes its own OAuth token when expired, so cold boot works without launching Claude Code first.
+
+**Fable** — the per-model weekly cap only exists in the OAuth endpoint's `limits[]` array (the header-probe fallback can't see it), so the last reading is cached in the state file and survives throttle windows and restarts.
+
+**ChatGPT** — no polling at all. The Codex CLI embeds a plan-level `rate_limits` block (primary = 5 h, secondary = weekly — the same meters ChatGPT Settings → Usage shows) in every session log under `~/.codex/sessions/`. The dashboard tails the newest log each cycle: free, offline, unthrottleable. Freshness equals your last Codex activity; ChatGPT-app usage between Codex runs shows up on the next run.
+
+**Taskbar embed** — the overlay is a `WS_CHILD` window `SetParent`'d into `Shell_TrayWnd`, so the shell can't paint over it. It survives explorer restarts, lock/unlock, and sleep via session-change notifications, and slides left of any small topmost pill (dictation bubbles, recorders) that docks over its spot near the tray.
+
+**Single instance** — launching the script terminates any older instance of itself first (newest launch wins), so re-running `run.bat` always means "restart with current code" — no stacked ghosts fighting over the taskbar and state file.
 
 ## Install
 
@@ -48,6 +69,8 @@ pythonw usagedashboard.py
 ```
 
 Auto-start: `Win+R` → `shell:startup` → drop a shortcut to `run.bat`.
+
+Regenerate the README art: `python docs/render.py`.
 
 ## Acknowledgments
 

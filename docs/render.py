@@ -1,4 +1,4 @@
-"""Regenerate the screenshots in this folder.
+"""Regenerate the screenshots + timelapse GIF in this folder.
 
 Usage:  python docs/render.py
 
@@ -7,33 +7,60 @@ to capture live desktop screenshots (which leak wallpaper / tray contents).
 """
 from __future__ import annotations
 
+import io
 import sys
 from pathlib import Path
 
 # Import siblings from the repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PySide6.QtCore import Qt, QRectF
+from PySide6.QtCore import Qt, QBuffer, QRectF
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication
 
-from usagedashboard import make_tray_pixmap, urgency_color
+from usagedashboard import (
+    CLAUDE_TILE_BASE,
+    GROUP_SPLIT,
+    OPENAI_TILE_BASE,
+    make_tray_pixmap,
+    urgency_color,
+)
 
 
 # ---------------------------------------------------------------------------
-# Widget mock-up
+# Shared palette (mirrors usagedashboard.py)
 # ---------------------------------------------------------------------------
 
-WIDGET_W, WIDGET_H = 260, 150
+WIDGET_W, WIDGET_H = 560, 158
 BG = QColor(20, 22, 28, 255)
 TRACK = QColor(60, 65, 75, 255)
 TEXT = QColor(235, 235, 240)
 SUB = QColor(160, 165, 175)
 
+# (label, marker) in display order — OpenAI pair first, Claude trio after,
+# same as the live app.
+GAUGES = [
+    ("5h GPT", "g"), ("7d GPT", "gw"),
+    ("5h session", "h"), ("7d weekly", "d"), ("7d Fable", "fd"),
+]
+
+
+def _fmt_reset(tr_pct: float, window_h: float) -> str:
+    """Human countdown for `tr_pct`% remaining of a `window_h`-hour window."""
+    secs = int(tr_pct / 100.0 * window_h * 3600)
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
 
 def _draw_ring(p: QPainter, rect: QRectF, label: str,
                pct: float, time_rem_pct: float, reset: str) -> None:
-    # Same behavior as the tray: ring drains with time, number coloured by urgency.
+    # Same behavior as the app: ring drains with time, number coloured by urgency.
     size = min(rect.width(), rect.height() - 22)
     ring = QRectF(rect.center().x() - size / 2, rect.top() + 4, size, size)
     thickness = max(6.0, size * 0.12)
@@ -63,13 +90,11 @@ def _draw_ring(p: QPainter, rect: QRectF, label: str,
                Qt.AlignCenter, f"resets {reset}")
 
 
-def render_widget(pct5: float, pct7: float,
-                  tr5: float = 60, tr7: float = 70,
-                  reset5: str = "3h 12m",
-                  reset7: str = "4d 6h",
-                  scale: int = 2) -> QPixmap:
-    """Render the widget contents at the given utilizations + time-remaining %."""
-    pix = QPixmap(WIDGET_W * scale, WIDGET_H * scale)
+def render_widget(values: list[tuple[float, float, str]],
+                  scale: float = 2.0) -> QPixmap:
+    """Render the 5-ring widget. `values` = [(pct, time_rem_pct, reset), …]
+    in GAUGES order (OpenAI pair, then Claude trio)."""
+    pix = QPixmap(int(WIDGET_W * scale), int(WIDGET_H * scale))
     pix.fill(Qt.transparent)
     p = QPainter(pix)
     p.setRenderHint(QPainter.Antialiasing, True)
@@ -80,67 +105,29 @@ def render_widget(pct5: float, pct7: float,
     p.setPen(Qt.NoPen); p.setBrush(QBrush(BG))
     p.drawRoundedRect(bg, 14, 14)
 
+    # Five columns with a wider gap + divider between the provider groups —
+    # mirrors Widget.paintEvent.
     inner = bg.adjusted(10, 22, -10, -10)
-    half = inner.width() / 2
-    left = QRectF(inner.left(), inner.top(), half - 4, inner.height())
-    right = QRectF(inner.left() + half + 4, inner.top(),
-                   half - 4, inner.height())
-    _draw_ring(p, left, "5h session", pct5, tr5, reset5)
-    _draw_ring(p, right, "7d weekly", pct7, tr7, reset7)
+    gap, group_gap = 6, 14
+    n = len(GAUGES)
+    col_w = (inner.width() - gap * (n - 1) - group_gap) / n
+    x = inner.left()
+    for i, ((label, _), (pct, tr, reset)) in enumerate(zip(GAUGES, values)):
+        if i == GROUP_SPLIT:
+            div_x = x + group_gap / 2 - gap / 2
+            p.setPen(QPen(TRACK, 1))
+            p.drawLine(int(div_x), int(inner.top() - 8),
+                       int(div_x), int(inner.bottom()))
+            x += group_gap
+        _draw_ring(p, QRectF(x, inner.top(), col_w, inner.height()),
+                   label, pct, tr, reset)
+        x += col_w + gap
     p.end()
     return pix
 
 
 # ---------------------------------------------------------------------------
-# Tray strip mock-up
-# ---------------------------------------------------------------------------
-
-def render_tray_strip(pairs: list[tuple[float, float, float, float]],
-                      scale: int = 8,
-                      gap: int = 6,
-                      group_gap: int = 28) -> QPixmap:
-    """Show several (pct5, tr5, pct7, tr7) tuples as side-by-side icon pairs
-    (left = 5h session, right = 7d weekly)."""
-    base = 16
-    icon = base * scale
-    n = len(pairs)
-    w = group_gap + n * (2 * icon + gap + group_gap)
-    h = icon + 24
-    pix = QPixmap(w, h)
-    pix.fill(QColor(28, 30, 36))
-    p = QPainter(pix)
-    p.setRenderHint(QPainter.Antialiasing, True)
-    p.setRenderHint(QPainter.SmoothPixmapTransform, True)
-    p.setRenderHint(QPainter.TextAntialiasing, True)
-
-    label_font = QFont()
-    label_font.setPointSizeF(10)
-    p.setFont(label_font)
-    p.setPen(QColor(170, 175, 188))
-
-    x = group_gap
-    for pct5, tr5, pct7, tr7 in pairs:
-        i5 = make_tray_pixmap(pct5, tr5, base, marker="h").scaled(
-            icon, icon, Qt.KeepAspectRatio, Qt.FastTransformation
-        )
-        i7 = make_tray_pixmap(pct7, tr7, base, marker="d").scaled(
-            icon, icon, Qt.KeepAspectRatio, Qt.FastTransformation
-        )
-        y = 8
-        p.drawPixmap(x, y, i5)
-        p.drawPixmap(x + icon + gap, y, i7)
-        p.drawText(
-            QRectF(x, y + icon + 2, 2 * icon + gap, 20),
-            Qt.AlignCenter,
-            f"5h {int(round(pct5))}%  7d {int(round(pct7))}%",
-        )
-        x += 2 * icon + gap + group_gap
-    p.end()
-    return pix
-
-
-# ---------------------------------------------------------------------------
-# Mock Windows taskbar — shows the overlay icons in their actual context
+# Mock Windows taskbar — shows the overlay tiles in their actual context
 # ---------------------------------------------------------------------------
 
 TASKBAR_BG = QColor(32, 32, 32)
@@ -148,18 +135,30 @@ TASKBAR_TEXT = QColor(220, 220, 225)
 TASKBAR_DIM = QColor(160, 165, 175)
 
 
-def render_taskbar_mockup(pct5: float, tr5: float,
-                          pct7: float, tr7: float,
-                          width: int = 880, height: int = 56) -> QPixmap:
-    """A representative slice of the Windows taskbar with our overlay icons
-    embedded on the left, then fake chevron, fake tray icons, and clock.
-    Icons are drawn at actual taskbar height for visual fidelity."""
+def _draw_tile_row(p: QPainter, values: list[tuple[float, float]],
+                   x: int, y: int, icon: int, gap: int = 4,
+                   group_gap: int = 10) -> int:
+    """Draw the 5-tile overlay row exactly like TaskbarWidget.paintEvent.
+    Returns the row width."""
+    x0 = x
+    for i, ((_, marker), (pct, tr)) in enumerate(zip(GAUGES, values)):
+        if i == GROUP_SPLIT:
+            x += group_gap
+        base = OPENAI_TILE_BASE if i < GROUP_SPLIT else CLAUDE_TILE_BASE
+        p.drawPixmap(x, y, make_tray_pixmap(pct, tr, icon, marker, base))
+        x += icon + gap
+    return x - gap - x0
+
+
+def render_taskbar_mockup(values: list[tuple[float, float]],
+                          width: int = 940, height: int = 56) -> QPixmap:
+    """A representative slice of the Windows taskbar with the five overlay
+    tiles embedded on the left of a fake chevron, tray, and clock."""
     pix = QPixmap(width, height)
     pix.fill(QColor(20, 22, 26))
     p = QPainter(pix)
     p.setRenderHint(QPainter.Antialiasing, True)
     p.setRenderHint(QPainter.TextAntialiasing, True)
-    # Taskbar strip across the full width
     bar_y = 8
     bar_h = height - 16
     p.setPen(Qt.NoPen)
@@ -167,16 +166,11 @@ def render_taskbar_mockup(pct5: float, tr5: float,
     p.drawRect(0, bar_y, width, bar_h)
 
     icon = bar_h - 6
-    gap = 4
-    # Our overlay icons — positioned just left of where the "tray" starts
+    gap, group_gap = 4, 10
     tray_x = width - 320
-    overlay_w = icon * 2 + gap
-    overlay_x = tray_x - overlay_w - 12
-    overlay_y = bar_y + 3
-    i5 = make_tray_pixmap(pct5, tr5, icon, marker="h")
-    i7 = make_tray_pixmap(pct7, tr7, icon, marker="d")
-    p.drawPixmap(overlay_x, overlay_y, i5)
-    p.drawPixmap(overlay_x + icon + gap, overlay_y, i7)
+    row_w = icon * 5 + gap * 4 + group_gap
+    _draw_tile_row(p, values, tray_x - row_w - 12, bar_y + 3, icon,
+                   gap, group_gap)
 
     # Fake chevron
     p.setFont(QFont("Segoe UI", int(icon * 0.5)))
@@ -188,34 +182,42 @@ def render_taskbar_mockup(pct5: float, tr5: float,
     for col in [QColor(120, 170, 220), QColor(180, 180, 190),
                 QColor(180, 180, 190), QColor(140, 200, 180)]:
         p.setBrush(col); p.setPen(Qt.NoPen)
-        p.drawRoundedRect(tx, bar_y + bar_h / 2 - 8, 16, 16, 2, 2)
+        p.drawRoundedRect(tx, int(bar_y + bar_h / 2 - 8), 16, 16, 2, 2)
         tx += 28
 
     # Fake clock
     p.setFont(QFont("Segoe UI", 9))
     p.setPen(TASKBAR_TEXT)
     p.drawText(QRectF(width - 110, bar_y, 96, bar_h / 2),
-               Qt.AlignVCenter | Qt.AlignRight, "5:33 PM")
+               Qt.AlignVCenter | Qt.AlignRight, "8:58 PM")
     p.drawText(QRectF(width - 110, bar_y + bar_h / 2, 96, bar_h / 2),
-               Qt.AlignVCenter | Qt.AlignRight, "5/16/2026")
+               Qt.AlignVCenter | Qt.AlignRight, "7/9/2026")
     p.end()
     return pix
 
 
 # ---------------------------------------------------------------------------
-# Compose the hero image: taskbar mockup on top + floating widget below
+# Hero: taskbar mockup on top + floating widget below, with group captions
 # ---------------------------------------------------------------------------
 
+# One value set for the whole hero so both surfaces agree. Chosen to show
+# the full urgency gradient: green / blue / red / amber / red.
+HERO = [
+    (45.0, 55.0, "2h 45m"),   # 5h GPT      — on pace (green)
+    ( 5.0, 60.0, "4d 4h"),    # 7d GPT      — under-utilizing (blue)
+    (92.0, 40.0, "2h 0m"),    # 5h session  — will exhaust (red)
+    (55.0, 60.0, "4d 4h"),    # 7d weekly   — burning fast (amber)
+    (95.0, 39.0, "2d 17h"),   # 7d Fable    — pinned (red)
+]
+
+
 def render_hero() -> QPixmap:
-    # Two paired scenarios so the hero conveys both surfaces at once
-    taskbar = render_taskbar_mockup(72.0, 80.0, 35.0, 78.0,
-                                    width=940, height=56)
-    widget = render_widget(72.0, 35.0, tr5=80, tr7=78,
-                           reset5="4h 1m", reset7="5d 12h", scale=2)
+    taskbar = render_taskbar_mockup([(v[0], v[1]) for v in HERO])
+    widget = render_widget(HERO, scale=1.6)
 
     pad = 24
     W = max(taskbar.width(), widget.width()) + pad * 2
-    H = taskbar.height() + widget.height() + pad * 3 + 56
+    H = taskbar.height() + widget.height() + pad * 3 + 66
     pix = QPixmap(W, H)
     pix.fill(QColor(18, 20, 24))
     p = QPainter(pix)
@@ -228,7 +230,8 @@ def render_hero() -> QPixmap:
     # Section A: taskbar overlay
     y = pad
     p.drawText(QRectF(pad, y, W - 2*pad, 22), Qt.AlignLeft | Qt.AlignVCenter,
-               "in-taskbar overlay (lives next to your tray)")
+               "in-taskbar overlay — ChatGPT (teal) | Claude (slate), "
+               "right next to your tray")
     y += 22
     p.drawPixmap((W - taskbar.width()) // 2, y, taskbar)
     y += taskbar.height() + 20
@@ -243,66 +246,64 @@ def render_hero() -> QPixmap:
     return pix
 
 
-def render_urgency_explainer() -> QPixmap:
-    """3×3 grid of (low/mid/high %) × (fresh/half/imminent time) tray icons,
-    showing how the urgency model colors each cell."""
-    pcts =  [(" 8%",  8.0), ("50%", 50.0), ("92%", 92.0)]
-    times = [("fresh window\n(95% time)", 95.0),
-             ("half window\n(50% time)", 50.0),
-             ("imminent reset\n(5% time)",  5.0)]
+# ---------------------------------------------------------------------------
+# Timelapse GIF — a simulated day: session windows fill and reset, weekly
+# meters creep upward, colors follow the urgency model, white rings drain.
+# ---------------------------------------------------------------------------
 
-    icon_native = 16
-    upscale = 6
-    icon = icon_native * upscale
-    cell_w = icon + 40
-    cell_h = icon + 28
-    head_h = 110
-    side_w = 110
+def _session_cycle(t: float, phase: float, peak: float) -> tuple[float, float]:
+    """(pct, time_remaining%) of a 5h window at normalized day-time t∈[0,1).
+    The window resets `1/CYCLES` apart; usage climbs to ~peak within each."""
+    CYCLES = 3
+    local = ((t + phase) * CYCLES) % 1.0
+    pct = min(100.0, peak * min(1.0, local * 1.35))
+    return pct, (1.0 - local) * 100.0
 
-    W = side_w + 3 * cell_w + 30
-    H = head_h + 3 * cell_h + 40
-    pix = QPixmap(W, H); pix.fill(QColor(28, 30, 36))
-    p = QPainter(pix)
-    p.setRenderHint(QPainter.Antialiasing, True)
-    p.setRenderHint(QPainter.TextAntialiasing, True)
 
-    title = QFont(); title.setBold(True); title.setPointSizeF(11)
-    p.setFont(title); p.setPen(QColor(235, 235, 245))
-    p.drawText(QRectF(20, 14, W - 40, 22), Qt.AlignLeft,
-               "urgency = pct + time_remaining% − 100  (4-stop color gradient)")
-    sm = QFont(); sm.setPointSizeF(8)
-    p.setFont(sm); p.setPen(QColor(160, 165, 180))
-    p.drawText(QRectF(20, 32, W - 40, 18), Qt.AlignLeft,
-               "blue = under-utilizing, green = on pace, amber = burning fast, red = will exhaust")
+def render_timelapse_frames(n_frames: int = 64) -> list[QPixmap]:
+    frames = []
+    for f in range(n_frames):
+        t = f / n_frames
+        g5, g5tr = _session_cycle(t, 0.15, 88.0)
+        c5, c5tr = _session_cycle(t, 0.55, 96.0)
+        gw = 4.0 + 9.0 * t          # GPT weekly creeps 4 → 13
+        cw = 20.0 + 38.0 * t        # Claude weekly 20 → 58
+        fb = 40.0 + 56.0 * t        # Fable sprints 40 → 96 (green → red)
+        wk_tr = 62.0 - 14.0 * t     # weekly windows drain a little
+        values = [
+            (g5, g5tr, _fmt_reset(g5tr, 5)),
+            (gw, wk_tr, _fmt_reset(wk_tr, 168)),
+            (c5, c5tr, _fmt_reset(c5tr, 5)),
+            (cw, wk_tr, _fmt_reset(wk_tr, 168)),
+            (fb, wk_tr, _fmt_reset(wk_tr, 168)),
+        ]
+        frames.append(render_widget(values, scale=1.25))
+    return frames
 
-    # Column headers
-    p.setFont(title); p.setPen(QColor(200, 205, 215))
-    for ci, (tlabel, _) in enumerate(times):
-        x = side_w + ci * cell_w
-        p.drawText(QRectF(x, 55, cell_w, head_h - 55),
-                   Qt.AlignCenter | Qt.TextWordWrap, tlabel)
 
-    # Row labels + cells
-    for ri, (plabel, pct) in enumerate(pcts):
-        y = head_h + ri * cell_h
-        p.setFont(title); p.setPen(QColor(200, 205, 215))
-        p.drawText(QRectF(0, y + (icon - 14)//2, side_w - 8, 22),
-                   Qt.AlignRight | Qt.AlignVCenter, f"pct = {plabel}")
-        for ci, (_, trp) in enumerate(times):
-            x = side_w + ci * cell_w + (cell_w - icon) // 2
-            ic = make_tray_pixmap(pct, trp, icon_native, marker="h").scaled(
-                icon, icon, Qt.KeepAspectRatio, Qt.FastTransformation)
-            p.drawPixmap(x, y, ic)
-    p.end()
-    return pix
+def save_gif(frames: list[QPixmap], path: Path,
+             ms_per_frame: int = 110) -> None:
+    from PIL import Image
+    imgs = []
+    for pix in frames:
+        buf = QBuffer()
+        buf.open(QBuffer.ReadWrite)
+        pix.save(buf, "PNG")
+        img = Image.open(io.BytesIO(bytes(buf.data()))).convert("RGB")
+        imgs.append(img.quantize(colors=128, dither=Image.Dither.NONE))
+    imgs[0].save(
+        path, save_all=True, append_images=imgs[1:],
+        duration=ms_per_frame, loop=0, optimize=True,
+    )
 
 
 def main() -> None:
     app = QApplication.instance() or QApplication(sys.argv)
     out = Path(__file__).resolve().parent
     render_hero().save(str(out / "hero.png"))
-    for f in sorted(out.glob("*.png")):
-        print(f"{f.name:24s}  {f.stat().st_size:>6} bytes")
+    save_gif(render_timelapse_frames(), out / "timelapse.gif")
+    for f in sorted(list(out.glob("*.png")) + list(out.glob("*.gif"))):
+        print(f"{f.name:24s}  {f.stat().st_size:>7} bytes")
 
 
 if __name__ == "__main__":
