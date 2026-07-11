@@ -310,29 +310,53 @@ def fetch_usage_via_headers(token: str) -> tuple[dict | None, int | None]:
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 
 
+def _pick_plan_limit(candidates: list[dict]) -> dict | None:
+    """Choose the ChatGPT *plan* meter from recent rate_limits blocks.
+
+    Codex reports more than one bucket: the plan-level limit (limit_id
+    "codex", carrying plan_type e.g. "prolite" — the one ChatGPT Settings
+    -> Usage shows) plus separate per-model allowances (e.g. limit_id
+    "codex_bengalfox" / "GPT-5.3-Codex-Spark"). A session on a special
+    model reports only its own bucket, which sits at 0% and would read as
+    "no usage". Prefer the plan bucket; fall back to newest.
+
+    `candidates` is most-recent-first.
+    """
+    for rl in candidates:                       # canonical plan bucket
+        if rl.get("limit_id") == "codex":
+            return rl
+    for rl in candidates:                       # any plan-level meter
+        if rl.get("plan_type"):
+            return rl
+    return candidates[0] if candidates else None
+
+
 def fetch_openai_usage() -> dict | None:
-    """Newest ChatGPT plan rate-limit snapshot from Codex CLI session logs.
+    """ChatGPT plan rate-limit snapshot from Codex CLI session logs.
 
     Codex CLI embeds a `rate_limits` block in the token_count events it
     appends to ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl:
 
-        {"primary":   {"used_percent": 8.0, "window_minutes": 300,
+        {"limit_id": "codex", "plan_type": "prolite",
+         "primary":   {"used_percent": 8.0, "window_minutes": 300,
                        "resets_at": <epoch s>},          # 5h window
-         "secondary":  {... "window_minutes": 10080 ...}, # weekly
-         "plan_type": "prolite"}
+         "secondary": {... "window_minutes": 10080 ...}} # weekly
 
-    These are the same plan-level meters ChatGPT Settings -> Usage shows.
     Reading the tail of recent files is free, offline and unthrottleable;
     the trade-off is freshness — the snapshot is only as recent as the
     last Codex activity (ChatGPT app usage between Codex runs is unseen).
+    We gather the most recent block per limit bucket, then pick the plan
+    meter (see _pick_plan_limit) so a session on a special model doesn't
+    make the gauges read 0%.
     """
     try:
         files = sorted(
             CODEX_SESSIONS_DIR.glob("*/*/*/rollout-*.jsonl"),
             key=lambda p: p.stat().st_mtime, reverse=True,
-        )[:8]
+        )[:12]
     except OSError:
         return None
+    by_bucket: dict[str, dict] = {}   # limit_id -> most recent block
     for f in files:
         try:
             with open(f, "rb") as fh:
@@ -349,9 +373,14 @@ def fetch_openai_usage() -> dict | None:
                 rl = json.loads(line)["payload"]["rate_limits"]
             except (ValueError, KeyError, TypeError):
                 continue
-            if isinstance(rl, dict) and isinstance(rl.get("primary"), dict):
-                return rl
-    return None
+            if not (isinstance(rl, dict) and isinstance(rl.get("primary"), dict)):
+                continue
+            by_bucket.setdefault(rl.get("limit_id"), rl)
+        if "codex" in by_bucket:   # found the plan bucket; no need to dig further
+            break
+    # Preserve newest-first order: dict keeps insertion order, and we walk
+    # files newest-first, so the first-seen block per bucket is its latest.
+    return _pick_plan_limit(list(by_bucket.values()))
 
 
 def fmt_reset(iso: str | None) -> str:
