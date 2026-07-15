@@ -2,7 +2,7 @@
 
 **Every AI usage limit you pay for, always on screen.**
 
-Five live meters embedded in the Windows taskbar — ChatGPT's 5-hour and weekly limits on teal tiles, Claude's 5-hour session, 7-day weekly, and 7-day Fable limits on slate — each one a ring that drains with time and a percentage colored by whether you're *actually* going to run out.
+Four live meters embedded in the Windows taskbar — ChatGPT's weekly limit on a teal tile, Claude's 5-hour session, 7-day weekly, and 7-day Fable limits on slate — each one a ring that drains with time and a percentage colored by whether you're *actually* going to run out.
 
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
 ![python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
@@ -18,8 +18,7 @@ A day of usage, timelapsed — session windows fill and reset, weekly meters cre
 
 | tile | meter | source |
 |---|---|---|
-| `g` | ChatGPT 5-hour limit | Codex CLI session logs (local) |
-| `gw` | ChatGPT weekly limit | Codex CLI session logs (local) |
+| `gw` | ChatGPT weekly limit | Codex usage endpoint (live, free) |
 | `h` | Claude 5-hour session | Anthropic OAuth usage endpoint |
 | `d` | Claude 7-day weekly (all models) | Anthropic OAuth usage endpoint |
 | `fd` | Claude 7-day Fable | OAuth endpoint `limits[]` array |
@@ -53,7 +52,7 @@ Continuous gradient between anchors. Live curve over the full `(time_remaining, 
 
 **Fable** — the per-model weekly cap only exists in the OAuth endpoint's `limits[]` array (the header-probe fallback can't see it), so the last reading is cached in the state file and survives throttle windows and restarts.
 
-**ChatGPT** — no polling at all. The Codex CLI embeds a plan-level `rate_limits` block (primary = 5 h, secondary = weekly — the same meters ChatGPT Settings → Usage shows) in every session log under `~/.codex/sessions/`. The dashboard tails the newest log each cycle: free, offline, unthrottleable. Freshness equals your last Codex activity; ChatGPT-app usage between Codex runs shows up on the next run.
+**ChatGPT** — polls `GET https://chatgpt.com/backend-api/codex/usage` with the ChatGPT token from `~/.codex/auth.json` (kept fresh by the Codex CLI). It returns the plan's weekly usage as plain JSON with **no completion generated — zero token cost**, so it's live every cycle regardless of whether Codex is running. (ChatGPT plans now expose only a weekly cap; the old 5-hour limit is gone.) Falls back to tailing the local Codex session logs when offline, and caches the last reading so it survives restarts.
 
 **Taskbar embed** — the overlay is a `WS_CHILD` window `SetParent`'d into `Shell_TrayWnd`, so the shell can't paint over it. It survives explorer restarts, lock/unlock, and sleep via session-change notifications, and slides left of any small topmost pill (dictation bubbles, recorders) that docks over its spot near the tray.
 

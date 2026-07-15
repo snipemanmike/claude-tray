@@ -2,12 +2,12 @@
 Always-on Claude Code usage dashboard.
 
 Two surfaces, same visual language:
-  - Five taskbar tiles — OpenAI/ChatGPT (5h, weekly, read from local
-    Codex CLI session logs) then Claude (5h session, 7d weekly, 7d Fable) —
-    with the % in the centre coloured by an urgency model
-    (pct + time_remaining% − 100) and a white perimeter ring that drains
-    as the reset window elapses. Providers are demarcated by tile base
-    colour (slate vs teal), marker letters, and a wider gap.
+  - Four taskbar tiles — OpenAI/ChatGPT (weekly, from the free Codex usage
+    endpoint) then Claude (5h session, 7d weekly, 7d Fable) — with the % in
+    the centre coloured by an urgency model (pct + time_remaining% − 100)
+    and a white perimeter ring that drains as the reset window elapses.
+    Providers are demarcated by tile base colour (slate vs teal), marker
+    letters, and a wider gap.
   - Frameless transparent always-on-top widget mirroring the same ring
     behaviour at a larger size, with reset countdowns and labels.
 
@@ -88,7 +88,7 @@ RED   = QColor(235,  80,  80)   # will exhaust before the window resets
 # Provider demarcation: gauges [:GROUP_SPLIT] are OpenAI, the rest Claude.
 # OpenAI tiles get a teal-dark base (vs Claude's neutral slate) and both
 # surfaces put a wider gap / divider line between the two groups.
-GROUP_SPLIT = 2
+GROUP_SPLIT = 1
 CLAUDE_TILE_BASE = QColor(40, 44, 52)
 OPENAI_TILE_BASE = QColor(22, 48, 42)
 
@@ -307,7 +307,115 @@ def fetch_usage_via_headers(token: str) -> tuple[dict | None, int | None]:
         return None, None
 
 
-CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+CODEX_HOME = Path.home() / ".codex"
+CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
+CODEX_AUTH_PATH = CODEX_HOME / "auth.json"
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/codex/usage"
+WEEKLY_WINDOW_SECONDS = 7 * 86400
+
+
+def _read_codex_auth() -> tuple[str, str] | None:
+    """(access_token, account_id) from the Codex CLI auth file, or None.
+
+    Codex keeps this token fresh (~10-day lifetime, rotated on use), so we
+    just re-read it each poll rather than running our own refresh.
+    """
+    try:
+        data = json.loads(CODEX_AUTH_PATH.read_text(encoding="utf-8"))
+        tokens = data["tokens"]
+        token = tokens["access_token"]
+        return token, (tokens.get("account_id") or "")
+    except Exception:
+        return None
+
+
+def _pick_weekly_window(windows: list[dict]) -> dict | None:
+    """The weekly meter = the window with the largest limit_window_seconds.
+
+    ChatGPT plans now expose only a weekly cap (primary_window, 604800 s;
+    the old 5-hour secondary is gone), but picking by window length keeps
+    this correct if a shorter window ever reappears.
+    """
+    best = None
+    for w in windows:
+        secs = w.get("limit_window_seconds") or 0
+        if best is None or secs > (best.get("limit_window_seconds") or 0):
+            best = w
+    return best
+
+
+def _window_reading(w: dict) -> tuple[float, str | None, int]:
+    """(used_percent, reset_iso, window_seconds) from a usage window dict."""
+    reset_at = w.get("reset_at")
+    iso = (datetime.fromtimestamp(reset_at, timezone.utc).isoformat()
+           if reset_at else None)
+    win_s = int(w.get("limit_window_seconds") or WEEKLY_WINDOW_SECONDS)
+    return float(w["used_percent"]), iso, win_s
+
+
+def fetch_openai_weekly_live() -> tuple[float, str | None, int] | None:
+    """Live ChatGPT weekly usage via the free Codex usage endpoint.
+
+    GET /backend-api/codex/usage returns the plan rate limit as plain JSON
+    with NO completion generated — zero token cost, unlike a chat probe.
+    Uses the ChatGPT token from auth.json. Returns
+    (used_percent, reset_iso, window_seconds), or None on any failure
+    (offline, token expired, throttled) so the caller can fall back.
+    """
+    auth = _read_codex_auth()
+    if not auth:
+        return None
+    token, account_id = auth
+    try:
+        r = requests.get(
+            CODEX_USAGE_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "chatgpt-account-id": account_id,
+                "originator": "codex_cli_rs",
+                "User-Agent": USER_AGENT,
+            },
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        rl = (r.json() or {}).get("rate_limit") or {}
+    except Exception:
+        return None
+    windows = [
+        w for key in ("primary_window", "secondary_window")
+        if isinstance((w := rl.get(key)), dict)
+        and w.get("used_percent") is not None
+    ]
+    weekly = _pick_weekly_window(windows)
+    return _window_reading(weekly) if weekly else None
+
+
+def fetch_openai_weekly_from_logs() -> tuple[float, str | None, int] | None:
+    """Offline fallback: derive weekly usage from Codex session logs."""
+    rl = fetch_openai_usage()
+    if not rl:
+        return None
+    windows = []
+    for key in ("primary", "secondary"):
+        b = rl.get(key)
+        if isinstance(b, dict) and b.get("used_percent") is not None:
+            windows.append({
+                "used_percent": b["used_percent"],
+                "limit_window_seconds": (b.get("window_minutes") or 0) * 60,
+                "reset_at": b.get("resets_at"),
+            })
+    weekly = _pick_weekly_window(windows)
+    return _window_reading(weekly) if weekly else None
+
+
+def openai_weekly() -> tuple[float, str | None, int] | None:
+    """(used_percent, reset_iso, window_seconds) for ChatGPT weekly usage.
+
+    Prefers the live endpoint (fresh, free); falls back to the local
+    session logs (only as recent as your last Codex run) when offline.
+    """
+    return fetch_openai_weekly_live() or fetch_openai_weekly_from_logs()
 
 
 def _pick_plan_limit(candidates: list[dict]) -> dict | None:
@@ -510,17 +618,17 @@ class Widget(QWidget):
         # Don't steal focus when shown — otherwise the taskbar overlay gets
         # demoted in the topmost band and the Windows taskbar paints over it.
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        # Min width holds each of the five gauges at ~90px.
-        self.setMinimumSize(QSize(470, 130))
+        # Min width holds each of the four gauges at ~90px.
+        self.setMinimumSize(QSize(390, 130))
 
         self.gauge_5h = RingGauge("5h session")
         self.gauge_7d = RingGauge("7d weekly")
         self.gauge_fable = RingGauge("7d Fable")
-        self.gauge_gpt5h = RingGauge("5h GPT")
-        self.gauge_gptw = RingGauge("7d GPT")
+        self.gauge_gptw = RingGauge("GPT weekly")
         # Paint/taskbar order with per-tile marker; [:GROUP_SPLIT] = OpenAI.
+        # ChatGPT plans expose only a weekly cap now (no 5-hour window).
         self._all_gauges: list[tuple[RingGauge, str]] = [
-            (self.gauge_gpt5h, "g"), (self.gauge_gptw, "gw"),
+            (self.gauge_gptw, "gw"),
             (self.gauge_5h, "h"), (self.gauge_7d, "d"),
             (self.gauge_fable, "fd"),
         ]
@@ -542,9 +650,18 @@ class Widget(QWidget):
             if trf:  # non-zero/non-None => window still open
                 self.gauge_fable.update(cached_fpct, cached_freset, trf)
 
+        # Seed ChatGPT weekly the same way, so a restart shows a value before
+        # the first poll returns.
+        cached_gpct = state.get("gptw_pct")
+        cached_greset = state.get("gptw_resets_at")
+        if cached_gpct is not None and cached_greset:
+            trg = time_remaining_pct(cached_greset, WEEKLY_WINDOW_SECONDS)
+            if trg:
+                self.gauge_gptw.update(cached_gpct, cached_greset, trg)
+
         x = state.get("x")
         y = state.get("y")
-        self.resize(state.get("w", 520), state.get("h", 150))
+        self.resize(state.get("w", 450), state.get("h", 150))
         self._opacity = state.get("opacity", 0.92)
         self.setWindowOpacity(self._opacity)
         if x is not None and y is not None and self._point_on_some_screen(x, y):
@@ -602,8 +719,8 @@ class Widget(QWidget):
         p.setBrush(QBrush(BG_COLOR))
         p.drawRoundedRect(bg, 14, 14)
 
-        # Layout: five gauges side by side (OpenAI pair | Claude trio) with
-        # label area above and a divider line between the provider groups.
+        # Layout: gauges side by side (OpenAI | Claude) with the label area
+        # above and a divider line between the provider groups.
         inner = bg.adjusted(10, 22, -10, -10)
         gauges = [g for g, _ in self._all_gauges]
         gap, group_gap = 6, 14
@@ -633,35 +750,19 @@ class Widget(QWidget):
 
     # --- polling -----------------------------------------------------------
     def _update_openai(self) -> None:
-        """Refresh the two GPT gauges from the local Codex session logs.
+        """Refresh the ChatGPT weekly gauge.
 
-        Free and offline, so it runs every poll regardless of how the
-        Anthropic endpoints are doing.
+        Prefers the free live usage endpoint; falls back to local Codex
+        logs. Free and independent of the Anthropic endpoints, so it runs
+        every poll. Caches the reading so it survives restarts.
         """
-        rl = fetch_openai_usage()
-        if not rl:
+        reading = openai_weekly()
+        if reading is None:
             return
-        now = time.time()
-        for gauge, block in ((self.gauge_gpt5h, rl.get("primary")),
-                             (self.gauge_gptw, rl.get("secondary"))):
-            if not isinstance(block, dict):
-                continue
-            resets_epoch = block.get("resets_at")
-            window_s = (block.get("window_minutes") or 0) * 60
-            if resets_epoch and resets_epoch < now:
-                # The snapshot predates a window reset and Codex hasn't run
-                # since, so nothing has been used in the current window.
-                # (ChatGPT-app usage in the meantime is invisible to us.)
-                gauge.update(0.0, None, None)
-                continue
-            iso = None
-            if resets_epoch:
-                iso = datetime.fromtimestamp(
-                    resets_epoch, timezone.utc).isoformat()
-            gauge.update(
-                block.get("used_percent"), iso,
-                time_remaining_pct(iso, window_s) if window_s else None,
-            )
+        pct, iso, window_s = reading
+        self.gauge_gptw.update(
+            pct, iso, time_remaining_pct(iso, window_s) if window_s else None)
+        self._persist()
 
     def refresh_now(self, manual: bool = False) -> None:
         self._update_openai()
@@ -734,11 +835,9 @@ class Widget(QWidget):
                 tip.append(f"7-day weekly: {pct7:.0f}% — resets in {reset7}")
             if pctf is not None:
                 tip.append(f"7-day Fable: {pctf:.0f}% — resets in {resetf}")
-            for gauge, name in ((self.gauge_gpt5h, "GPT 5-hour"),
-                                (self.gauge_gptw, "GPT weekly")):
-                if gauge.pct is not None:
-                    tip.append(f"{name}: {gauge.pct:.0f}% — resets in "
-                               f"{gauge.reset_label}")
+            if self.gauge_gptw.pct is not None:
+                tip.append(f"GPT weekly: {self.gauge_gptw.pct:.0f}% — resets "
+                           f"in {self.gauge_gptw.reset_label}")
             self.taskbar.setToolTip("\n".join(tip) or "loading…")
         if self.tray_5h is not None:
             self.tray_5h.setIcon(make_tray_icon(pct5, tr5, marker="h"))
@@ -772,11 +871,9 @@ class Widget(QWidget):
         if fable is not None and fable.get("percent") is not None:
             lines.append(f"fable (7d): {fable['percent']}%  "
                          f"resets {fmt_reset(fable.get('resets_at'))}")
-        for gauge, name in ((self.gauge_gpt5h, "gpt (5h)"),
-                            (self.gauge_gptw, "gpt (7d)")):
-            if gauge.pct is not None:
-                lines.append(f"{name}: {gauge.pct:.1f}%  "
-                             f"resets {gauge.reset_label}")
+        if self.gauge_gptw.pct is not None:
+            lines.append(f"gpt (7d): {self.gauge_gptw.pct:.1f}%  "
+                         f"resets {self.gauge_gptw.reset_label}")
         extra = data.get("extra_usage")
         if isinstance(extra, dict) and extra.get("is_enabled"):
             lines.append(f"extra: {extra.get('utilization')}% of "
@@ -807,7 +904,7 @@ class Widget(QWidget):
         # Scroll to resize
         delta = e.angleDelta().y() / 120
         scale = 1.0 + (0.07 * delta)
-        new_w = max(180, min(520, int(self.width() * scale)))
+        new_w = max(390, min(640, int(self.width() * scale)))
         new_h = max(110, min(320, int(self.height() * scale)))
         self.resize(new_w, new_h)
         self._persist()
@@ -948,6 +1045,9 @@ class Widget(QWidget):
         if self.gauge_fable.pct is not None:
             state["fable_pct"] = self.gauge_fable.pct
             state["fable_resets_at"] = self.gauge_fable.reset_iso
+        if self.gauge_gptw.pct is not None:
+            state["gptw_pct"] = self.gauge_gptw.pct
+            state["gptw_resets_at"] = self.gauge_gptw.reset_iso
         save_state(state)
 
 
@@ -1111,7 +1211,7 @@ class TaskbarWidget(QWidget):
         self._on_click = on_click
         # (pct, time_rem_pct, marker) per tile; [:GROUP_SPLIT] = OpenAI
         self._entries: list[tuple[float | None, float | None, str]] = [
-            (None, None, m) for m in ("g", "gw", "h", "d", "fd")
+            (None, None, m) for m in ("gw", "h", "d", "fd")
         ]
         self._icon_size = 28
         self._gap = 4

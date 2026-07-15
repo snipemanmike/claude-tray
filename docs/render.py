@@ -31,16 +31,16 @@ from usagedashboard import (
 # Shared palette (mirrors usagedashboard.py)
 # ---------------------------------------------------------------------------
 
-WIDGET_W, WIDGET_H = 560, 158
+WIDGET_W, WIDGET_H = 470, 158
 BG = QColor(20, 22, 28, 255)
 TRACK = QColor(60, 65, 75, 255)
 TEXT = QColor(235, 235, 240)
 SUB = QColor(160, 165, 175)
 
-# (label, marker) in display order — OpenAI pair first, Claude trio after,
-# same as the live app.
+# (label, marker) in display order — OpenAI first, Claude trio after,
+# same as the live app. ChatGPT plans expose only a weekly cap now.
 GAUGES = [
-    ("5h GPT", "g"), ("7d GPT", "gw"),
+    ("GPT weekly", "gw"),
     ("5h session", "h"), ("7d weekly", "d"), ("7d Fable", "fd"),
 ]
 
@@ -168,7 +168,8 @@ def render_taskbar_mockup(values: list[tuple[float, float]],
     icon = bar_h - 6
     gap, group_gap = 4, 10
     tray_x = width - 320
-    row_w = icon * 5 + gap * 4 + group_gap
+    n = len(GAUGES)
+    row_w = icon * n + gap * (n - 1) + group_gap
     _draw_tile_row(p, values, tray_x - row_w - 12, bar_y + 3, icon,
                    gap, group_gap)
 
@@ -201,10 +202,9 @@ def render_taskbar_mockup(values: list[tuple[float, float]],
 # ---------------------------------------------------------------------------
 
 # One value set for the whole hero so both surfaces agree. Chosen to show
-# the full urgency gradient: green / blue / red / amber / red.
+# the full urgency gradient: blue / red / amber / red.
 HERO = [
-    (45.0, 55.0, "2h 45m"),   # 5h GPT      — on pace (green)
-    ( 5.0, 60.0, "4d 4h"),    # 7d GPT      — under-utilizing (blue)
+    ( 6.0, 62.0, "5d 8h"),    # GPT weekly  — under-utilizing (blue)
     (92.0, 40.0, "2h 0m"),    # 5h session  — will exhaust (red)
     (55.0, 60.0, "4d 4h"),    # 7d weekly   — burning fast (amber)
     (95.0, 39.0, "2d 17h"),   # 7d Fable    — pinned (red)
@@ -264,20 +264,18 @@ def render_timelapse_frames(n_frames: int = 64) -> list[QPixmap]:
     frames = []
     for f in range(n_frames):
         t = f / n_frames
-        g5, g5tr = _session_cycle(t, 0.15, 88.0)
         c5, c5tr = _session_cycle(t, 0.55, 96.0)
-        gw = 4.0 + 9.0 * t          # GPT weekly creeps 4 → 13
+        gw = 4.0 + 32.0 * t         # GPT weekly creeps 4 → 36
         cw = 20.0 + 38.0 * t        # Claude weekly 20 → 58
         fb = 40.0 + 56.0 * t        # Fable sprints 40 → 96 (green → red)
         wk_tr = 62.0 - 14.0 * t     # weekly windows drain a little
         values = [
-            (g5, g5tr, _fmt_reset(g5tr, 5)),
             (gw, wk_tr, _fmt_reset(wk_tr, 168)),
             (c5, c5tr, _fmt_reset(c5tr, 5)),
             (cw, wk_tr, _fmt_reset(wk_tr, 168)),
             (fb, wk_tr, _fmt_reset(wk_tr, 168)),
         ]
-        frames.append(render_widget(values, scale=1.25))
+        frames.append(render_widget(values, scale=1.3))
     return frames
 
 
